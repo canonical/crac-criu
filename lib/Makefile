@@ -1,5 +1,5 @@
-CRIU_SO			:= libcriu.so
-CRIU_A			:= libcriu.a
+CRIU_SO			:= libcriu-crac.so
+CRIU_A			:= libcriu-crac.a
 UAPI_HEADERS		:= lib/c/criu.h images/rpc.proto images/rpc.pb-c.h criu/include/version.h
 
 all-y	+= lib-c lib-a lib-py
@@ -48,12 +48,12 @@ install: lib-c lib-a lib-py crit/crit lib/c/criu.pc.in
 	$(Q) ln -fns $(CRIU_SO).$(CRIU_SO_VERSION_MAJOR).$(CRIU_SO_VERSION_MINOR) $(DESTDIR)$(LIBDIR)/$(CRIU_SO).$(CRIU_SO_VERSION_MAJOR)
 	$(Q) ln -fns $(CRIU_SO).$(CRIU_SO_VERSION_MAJOR).$(CRIU_SO_VERSION_MINOR) $(DESTDIR)$(LIBDIR)/$(CRIU_SO)
 	$(Q) install -m 755 lib/c/$(CRIU_A) $(DESTDIR)$(LIBDIR)/$(CRIU_A)
-	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/criu/
-	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/criu/
+	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/
+	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/
 	$(E) "  INSTALL " pkgconfig/criu.pc
 	$(Q) mkdir -p $(DESTDIR)$(LIBDIR)/pkgconfig
-	$(Q) sed -e 's,@version@,$(CRIU_VERSION),' -e 's,@libdir@,$(LIBDIR),' -e 's,@includedir@,$(dir $(INCLUDEDIR)/criu/),' lib/c/criu.pc.in > lib/c/criu.pc
-	$(Q) install -m 644 lib/c/criu.pc $(DESTDIR)$(LIBDIR)/pkgconfig
+	$(Q) sed -e 's,@version@,$(CRIU_VERSION),' -e 's,@libdir@,$(LIBDIR),' -e 's,@includedir@,$(dir $(INCLUDEDIR)/crac-criu/criu/),' lib/c/criu.pc.in > lib/c/criu.pc
+	$(Q) install -m 644 lib/c/criu.pc $(DESTDIR)$(LIBDIR)/pkgconfig/crac-criu.pc
 ifeq ($(PYTHON),python3)
 	$(E) "  INSTALL " crit
 	$(Q) $(PYTHON) -m pip install --no-build-isolation --no-index --no-deps --progress-bar off --upgrade --force-reinstall --prefix=$(DESTDIR)$(PREFIX) ./crit
@@ -66,9 +66,9 @@ uninstall:
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(CRIU_SO))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(CRIU_A))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(CRIU_SO).$(CRIU_SO_VERSION_MAJOR).$(CRIU_SO_VERSION_MINOR))
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/criu/,$(notdir $(UAPI_HEADERS)))
-	$(E) " UNINSTALL" pkgconfig/criu.pc
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/pkgconfig/,criu.pc)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/,$(notdir $(UAPI_HEADERS)))
+	$(E) " UNINSTALL" pkgconfig/crac-criu.pc
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/pkgconfig/,crac-criu.pc)
 ifeq ($(PYTHON),python3)
 	$(E) " UNINSTALL" crit
 	$(Q) $(PYTHON) ./scripts/uninstall_module.py --prefix=$(DESTDIR)$(PREFIX) crit
