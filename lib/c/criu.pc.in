@@ -1,8 +1,8 @@
 libdir=@libdir@
 includedir=@includedir@
 
-Name: CRIU for OpenJDK CRaC
+Name: crac-criu
 Description: CRIU adapted for the OpenJDK CRaC project 
 Version: @version@
-Libs: -L${libdir} -lcriu
+Libs: -L${libdir} -lcriu-crac
 Cflags: -I${includedir}
