@@ -1,8 +1,8 @@
 libdir=@libdir@
 includedir=@includedir@
 
-Name: CRIU
-Description: RPC library for userspace checkpoint and restore
+Name: CRIU for OpenJDK CRaC
+Description: CRIU adapted for the OpenJDK CRaC project 
 Version: @version@
 Libs: -L${libdir} -lcriu
 Cflags: -I${includedir}

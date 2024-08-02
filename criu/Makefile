@@ -140,22 +140,22 @@ UAPI_HEADERS += criu/include/criu-log.h
 install: $(obj)/criu
 	$(E) "  INSTALL " $(obj)/criu
 	$(Q) mkdir -p $(DESTDIR)$(SBINDIR)
-	$(Q) install -m 755 $(obj)/criu $(DESTDIR)$(SBINDIR)
-	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/criu/
-	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/criu/
+	$(Q) install -m 755 $(obj)/criu $(DESTDIR)$(SBINDIR)/criu-crac
+	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/
+	$(Q) install -m 644 $(UAPI_HEADERS) $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/
 	$(Q) mkdir -p $(DESTDIR)$(LIBEXECDIR)/criu/scripts
 	$(Q) install -m 755 scripts/systemd-autofs-restart.sh $(DESTDIR)$(LIBEXECDIR)/criu/scripts
 ifeq ($(PYTHON),python3)
 	$(E) "  INSTALL " scripts/criu-ns
-	$(Q) install -m 755 scripts/criu-ns $(DESTDIR)$(SBINDIR)
+	$(Q) install -m 755 scripts/criu-ns $(DESTDIR)$(SBINDIR)/criu-ns-crac
 endif
 .PHONY: install
 
 uninstall:
 	$(E) " UNINSTALL" criu
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu)
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu-ns)
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/criu/,$(notdir $(UAPI_HEADERS)))
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu-crac)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(SBINDIR)/,criu-ns-crac)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(INCLUDEDIR)/crac-criu/criu/,$(notdir $(UAPI_HEADERS)))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBEXECDIR)/criu/scripts/,systemd-autofs-restart.sh)
 .PHONY: uninstall
 

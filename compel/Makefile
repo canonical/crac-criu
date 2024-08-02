@@ -54,7 +54,7 @@ cleanup-y		+= compel/libcompel.so
 install: compel/compel compel/$(LIBCOMPEL_SO) compel/$(LIBCOMPEL_A)
 	$(E) "  INSTALL " compel
 	$(Q) mkdir -p $(DESTDIR)$(BINDIR)
-	$(Q) install -m 755 compel/compel $(DESTDIR)$(BINDIR)
+	$(Q) install -m 755 compel/compel $(DESTDIR)$(BINDIR)/compel-crac
 	$(E) "  INSTALL " $(LIBCOMPEL_SO)
 	$(Q) mkdir -p $(DESTDIR)$(LIBDIR)
 	$(Q) install -m 0644 compel/$(LIBCOMPEL_SO) $(DESTDIR)$(LIBDIR)
@@ -64,16 +64,16 @@ install: compel/compel compel/$(LIBCOMPEL_SO) compel/$(LIBCOMPEL_A)
 	$(E) "  INSTALL " $(LIBCOMPEL_A)
 	$(Q) install -m 0644 compel/$(LIBCOMPEL_A) $(DESTDIR)$(LIBDIR)
 	$(E) "  INSTALL " compel uapi
-	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/compel/asm
-	$(Q) cp compel/include/uapi/*.h $(DESTDIR)$(INCLUDEDIR)/compel/
-	$(Q) cp compel/include/uapi/asm/*.h $(DESTDIR)$(INCLUDEDIR)/compel/asm/
-	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/compel/common/asm
-	$(Q) cp include/common/compiler.h $(DESTDIR)$(INCLUDEDIR)/compel/common/
+	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/crac-criu/compel/asm
+	$(Q) cp compel/include/uapi/*.h $(DESTDIR)$(INCLUDEDIR)/crac-criu/compel/
+	$(Q) cp compel/include/uapi/asm/*.h $(DESTDIR)$(INCLUDEDIR)/crac-criu/compel/asm/
+	$(Q) mkdir -p $(DESTDIR)$(INCLUDEDIR)/crac-criu/compel/common/asm
+	$(Q) cp include/common/compiler.h $(DESTDIR)$(INCLUDEDIR)/crac-criu/compel/common/
 .PHONY: install
 
 uninstall:
 	$(E) " UNINSTALL" compel
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(BINDIR)/,compel)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(BINDIR)/,compel-crac)
 	$(E) " UNINSTALL" $(LIBCOMPEL_SO)
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(LIBCOMPEL_SO))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(LIBCOMPEL_SO).$(COMPEL_SO_VERSION_MAJOR))
@@ -81,5 +81,5 @@ uninstall:
 	$(E) " UNINSTALL" $(LIBCOMPEL_A)
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(LIBCOMPEL_A))
 	$(E) " UNINSTALL" compel uapi
-	$(Q) $(RM) -rf $(addprefix $(DESTDIR)$(INCLUDEDIR)/,compel/*)
+	$(Q) $(RM) -rf $(addprefix $(DESTDIR)$(INCLUDEDIR)/,crac-criu/compel/*)
 .PHONY: uninstall
