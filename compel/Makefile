@@ -54,7 +54,7 @@ cleanup-y		+= compel/libcompel.so
 install: compel/compel compel/$(LIBCOMPEL_SO) compel/$(LIBCOMPEL_A)
 	$(E) "  INSTALL " compel
 	$(Q) mkdir -p $(DESTDIR)$(BINDIR)
-	$(Q) install -m 755 compel/compel $(DESTDIR)$(BINDIR)/compel-crac
+	$(Q) install -m 755 compel/compel $(DESTDIR)$(BINDIR)/crac-compel
 	$(E) "  INSTALL " $(LIBCOMPEL_SO)
 	$(Q) mkdir -p $(DESTDIR)$(LIBDIR)
 	$(Q) install -m 0644 compel/$(LIBCOMPEL_SO) $(DESTDIR)$(LIBDIR)
@@ -73,7 +73,7 @@ install: compel/compel compel/$(LIBCOMPEL_SO) compel/$(LIBCOMPEL_A)
 
 uninstall:
 	$(E) " UNINSTALL" compel
-	$(Q) $(RM) $(addprefix $(DESTDIR)$(BINDIR)/,compel-crac)
+	$(Q) $(RM) $(addprefix $(DESTDIR)$(BINDIR)/,crac-compel)
 	$(E) " UNINSTALL" $(LIBCOMPEL_SO)
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(LIBCOMPEL_SO))
 	$(Q) $(RM) $(addprefix $(DESTDIR)$(LIBDIR)/,$(LIBCOMPEL_SO).$(COMPEL_SO_VERSION_MAJOR))
