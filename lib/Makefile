@@ -1,5 +1,5 @@
-CRIU_SO			:= libcriu-crac.so
-CRIU_A			:= libcriu-crac.a
+CRIU_SO			:= libcrac-criu.so
+CRIU_A			:= libcrac-criu.a
 UAPI_HEADERS		:= lib/c/criu.h images/rpc.proto images/rpc.pb-c.h criu/include/version.h
 
 all-y	+= lib-c lib-a lib-py
