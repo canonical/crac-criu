@@ -21,7 +21,9 @@ RUN apk update && apk add \
 	py3-pip \
 	py3-protobuf \
 	python3 \
-	sudo
+	sudo \
+	libcap-utils \
+	util-linux
 
 COPY . /criu
 WORKDIR /criu
@@ -38,14 +40,12 @@ RUN apk add \
 	e2fsprogs \
 	py-yaml \
 	py3-flake8 \
+	py3-importlib-metadata \
 	asciidoctor
 
 # The rpc test cases are running as user #1000, let's add the user
 RUN adduser -u 1000 -D test
 
 RUN pip3 install junit_xml
-
-# For zdtm we need an unversioned python binary
-RUN ln -s /usr/bin/python3 /usr/bin/python
 
 RUN make -C test/zdtm

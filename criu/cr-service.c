@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <arpa/inet.h>
 #include <sched.h>
+#include <sys/prctl.h>
 
 #include "version.h"
 #include "crtools.h"
@@ -409,6 +410,12 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		pr_debug("Would overwrite RPC settings with values from %s\n", req->config_file);
 	}
 
+	if (req->has_unprivileged)
+		opts.unprivileged = req->unprivileged;
+
+	if (check_caps())
+		return 1;
+
 	if (kerndat_init())
 		return 1;
 
@@ -463,6 +470,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 
 	if (req->has_shell_job)
 		opts.shell_job = req->shell_job;
+
+	if (req->has_skip_file_rwx_check)
+		opts.skip_file_rwx_check = req->skip_file_rwx_check;
 
 	if (req->has_file_locks)
 		opts.handle_file_locks = req->file_locks;
@@ -742,7 +752,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
+	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
 
 	if (init_pidfd_store_hash())
 		goto pidfd_store_err;
@@ -785,7 +795,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	setproctitle("restore --rpc -D %s", images_dir);
+	__setproctitle("restore --rpc -D %s", images_dir);
 
 	if (cr_restore_tasks())
 		goto exit;
@@ -831,7 +841,7 @@ static int check(int sk, CriuOpts *req)
 	}
 
 	if (pid == 0) {
-		setproctitle("check --rpc");
+		__setproctitle("check --rpc");
 
 		opts.mode = CR_CHECK;
 		if (setup_opts_from_req(sk, req))
@@ -869,7 +879,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 		if (setup_opts_from_req(sk, req))
 			goto cout;
 
-		setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
+		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
 
 		if (init_pidfd_store_hash())
 			goto pidfd_store_err;
@@ -947,7 +957,7 @@ static int start_page_server_req(int sk, CriuOpts *req, bool daemon_mode)
 		if (setup_opts_from_req(sk, req))
 			goto out_ch;
 
-		setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
+		__setproctitle("page-server --rpc --address %s --port %hu", opts.addr, opts.port);
 
 		pr_debug("Starting page server\n");
 
@@ -1107,7 +1117,7 @@ static int handle_feature_check(int sk, CriuReq *msg)
 		if (kerndat_init())
 			exit(1);
 
-		setproctitle("feature-check --rpc");
+		__setproctitle("feature-check --rpc");
 
 		if ((msg->features->has_mem_track == 1) && (msg->features->mem_track == true))
 			feat.mem_track = kdat.has_dirty_track;
@@ -1194,8 +1204,8 @@ static int handle_cpuinfo(int sk, CriuReq *msg)
 		if (setup_opts_from_req(sk, msg->opts))
 			goto cout;
 
-		setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
-			     images_dir);
+		__setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
+			       images_dir);
 
 		if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP)
 			ret = cpuinfo_dump();

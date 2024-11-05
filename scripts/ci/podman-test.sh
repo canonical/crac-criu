@@ -11,27 +11,14 @@ make install PREFIX=/usr
 
 criu --version
 
-# Install crun build dependencies
-scripts/ci/apt-install libyajl-dev libseccomp-dev libsystemd-dev
+# FIXME: Disable checkpoint/restore of cgroups
+# https://github.com/checkpoint-restore/criu/issues/2091
+mkdir -p /etc/criu
+echo "manage-cgroups ignore" > /etc/criu/runc.conf
+sed -i 's/#runtime\s*=\s*.*/runtime = "runc"/' /usr/share/containers/containers.conf
 
-# Install crun from source to test libcriu integration
-tmp_dir=$(mktemp -d -t ci-XXXXXXXXXX)
-pushd "${tmp_dir}"
-git clone --depth=1 https://github.com/containers/crun
-cd crun
-./autogen.sh && ./configure --prefix=/usr
-make -j"$(nproc)"
-make install
-popd
-rm -rf "${tmp_dir}"
+podman info
 
-# overlayfs with current Ubuntu kernel breaks CRIU
-# https://bugs.launchpad.net/ubuntu/+source/linux-azure/+bug/1967924
-# Use VFS storage drive as a work-around
-export STORAGE_DRIVER=vfs
-podman --storage-driver vfs info
-
-# shellcheck disable=SC2016
 podman run --name cr -d docker.io/library/alpine /bin/sh -c 'i=0; while true; do echo $i; i=$(expr $i + 1); sleep 1; done'
 
 sleep 1

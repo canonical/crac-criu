@@ -11,8 +11,13 @@
 #include <sys/sendfile.h>
 #include <sched.h>
 #include <sys/capability.h>
-#include <sys/mount.h>
+#include <sys/ioctl.h>
 #include <elf.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+
+#include "tty.h"
+#include "stats.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -29,6 +34,8 @@
  * and checked.
  */
 #define BUILD_ID_MAP_SIZE 1048576
+#define ST_UNIT		  512
+#define EXTENT_MAX_COUNT  512
 
 #include "cr_options.h"
 #include "imgset.h"
@@ -79,7 +86,7 @@ static LIST_HEAD(ghost_files);
 /*
  * When opening remaps we first create a link on the remap
  * target, then open one, then unlink. In case the remap
- * source has more than one instance, these tree steps
+ * source has more than one instance, these three steps
  * should be serialized with each other.
  */
 static mutex_t *remap_open_lock;
@@ -216,6 +223,92 @@ static int copy_file_to_chunks(int fd, struct cr_img *img, size_t file_size)
 	}
 
 	return 0;
+}
+
+static int skip_outstanding(struct fiemap_extent *fe, size_t file_size)
+{
+	/* Skip outstanding extent */
+	if (fe->fe_logical > file_size)
+		return 1;
+
+	/* Skip outstanding part of the extent */
+	if (fe->fe_logical + fe->fe_length > file_size)
+		fe->fe_length = file_size - fe->fe_logical;
+	return 0;
+}
+
+static int copy_file_to_chunks_fiemap(int fd, struct cr_img *img, size_t file_size)
+{
+	GhostChunkEntry ce = GHOST_CHUNK_ENTRY__INIT;
+	struct fiemap *fiemap_buf;
+	struct fiemap_extent *ext_buf;
+	int ext_buf_size, fie_buf_size;
+	off_t pos = 0;
+	unsigned int i;
+	int ret = 0;
+	int exit_code = 0;
+
+	ext_buf_size = EXTENT_MAX_COUNT * sizeof(struct fiemap_extent);
+	fie_buf_size = sizeof(struct fiemap) + ext_buf_size;
+
+	fiemap_buf = xzalloc(fie_buf_size);
+	if (!fiemap_buf) {
+		pr_perror("Out of memory when allocating fiemap");
+		return -1;
+	}
+
+	ext_buf = fiemap_buf->fm_extents;
+	fiemap_buf->fm_length = FIEMAP_MAX_OFFSET;
+	fiemap_buf->fm_flags |= FIEMAP_FLAG_SYNC;
+	fiemap_buf->fm_extent_count = EXTENT_MAX_COUNT;
+
+	do {
+		fiemap_buf->fm_start = pos;
+		memzero(ext_buf, ext_buf_size);
+		ret = ioctl(fd, FS_IOC_FIEMAP, fiemap_buf);
+		if (ret < 0) {
+			if (errno == EOPNOTSUPP) {
+				exit_code = -EOPNOTSUPP;
+			} else {
+				exit_code = -1;
+				pr_perror("fiemap ioctl() failed");
+			}
+			goto out;
+		} else if (fiemap_buf->fm_mapped_extents == 0) {
+			goto out;
+		}
+
+		for (i = 0; i < fiemap_buf->fm_mapped_extents; i++) {
+			if (skip_outstanding(&fiemap_buf->fm_extents[i], file_size))
+				continue;
+
+			ce.len = fiemap_buf->fm_extents[i].fe_length;
+			ce.off = fiemap_buf->fm_extents[i].fe_logical;
+
+			if (pb_write_one(img, &ce, PB_GHOST_CHUNK)) {
+				exit_code = -1;
+				goto out;
+			}
+
+			if (copy_chunk_from_file(fd, img_raw_fd(img), ce.off, ce.len)) {
+				exit_code = -1;
+				goto out;
+			}
+
+			if (fiemap_buf->fm_extents[i].fe_flags & FIEMAP_EXTENT_LAST) {
+				/* there are no extents left, break. */
+				goto out;
+			}
+		}
+
+		/* Record file's logical offset as pos */
+		pos = ce.len + ce.off;
+
+		/* Since there are still extents left, continue. */
+	} while (fiemap_buf->fm_mapped_extents == EXTENT_MAX_COUNT);
+out:
+	xfree(fiemap_buf);
+	return exit_code;
 }
 
 static int copy_chunk_to_file(int img, int fd, off_t off, size_t len)
@@ -414,7 +507,7 @@ static int nomntns_create_ghost(struct ghost_file *gf, GhostFileEntry *gfe, stru
 	if (ghost_apply_metadata(path, gfe))
 		return -1;
 
-	strlcpy(gf->remap.rpath, path + 1, PATH_MAX);
+	__strlcpy(gf->remap.rpath, path + 1, PATH_MAX);
 	pr_debug("Remap rpath is %s\n", gf->remap.rpath);
 	return 0;
 }
@@ -545,7 +638,7 @@ static int open_remap_ghost(struct reg_file_info *rfi, RemapFilePathEntry *rpe)
 	gf->remap.rmnt_id = rfi->rfe->mnt_id;
 
 	if (S_ISDIR(gfe->mode))
-		strlcpy(gf->remap.rpath, rfi->path, PATH_MAX);
+		__strlcpy(gf->remap.rpath, rfi->path, PATH_MAX);
 	else
 		ghost_path(gf->remap.rpath, PATH_MAX, rfi, rpe);
 
@@ -910,10 +1003,20 @@ static int dump_ghost_file(int _fd, u32 id, const struct stat *st, dev_t phys_de
 			goto err_out;
 		}
 
-		if (gfe.chunks)
-			ret = copy_file_to_chunks(fd, img, st->st_size);
-		else
+		if (gfe.chunks) {
+			if (opts.ghost_fiemap) {
+				ret = copy_file_to_chunks_fiemap(fd, img, st->st_size);
+				if (ret == -EOPNOTSUPP) {
+					pr_debug("file system don't support fiemap\n");
+					ret = copy_file_to_chunks(fd, img, st->st_size);
+				}
+			} else {
+				ret = copy_file_to_chunks(fd, img, st->st_size);
+			}
+		} else {
 			ret = copy_file(fd, img_raw_fd(img), st->st_size);
+		}
+
 		close(fd);
 		if (ret)
 			goto err_out;
@@ -946,8 +1049,8 @@ static int dump_ghost_remap(char *path, const struct stat *st, int lfd, u32 id, 
 
 	pr_info("Dumping ghost file for fd %d id %#x\n", lfd, id);
 
-	if (st->st_size > opts.ghost_limit) {
-		pr_err("Can't dump ghost file %s of %" PRIu64 " size, increase limit\n", path, st->st_size);
+	if (st->st_blocks * ST_UNIT > opts.ghost_limit) {
+		pr_err("Can't dump ghost file %s of %" PRIu64 " size, increase limit\n", path, st->st_blocks * ST_UNIT);
 		return -1;
 	}
 
@@ -1035,7 +1138,6 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
 	FownEntry fwn = FOWN_ENTRY__INIT;
 	int mntns_root;
-	int ret;
 	const struct stat *ost = &parms->stat;
 
 	if (!opts.link_remap_ok) {
@@ -1074,19 +1176,18 @@ static int create_link_remap(char *path, int len, int lfd, u32 *idp, struct ns_i
 
 	mntns_root = mntns_get_root_fd(nsid);
 
-again:
-	ret = linkat_hard(lfd, "", mntns_root, link_name, ost->st_uid, ost->st_gid, AT_EMPTY_PATH);
-	if (ret < 0 && errno == ENOENT) {
+	while (linkat_hard(lfd, "", mntns_root, link_name, ost->st_uid, ost->st_gid, AT_EMPTY_PATH) < 0) {
+		if (errno != ENOENT) {
+			pr_perror("Can't link remap to %s", path);
+			return -1;
+		}
+
 		/* Use grand parent, if parent directory does not exist. */
 		if (trim_last_parent(link_name) < 0) {
 			pr_err("trim failed: @%s@\n", link_name);
 			check_overlayfs_fallback(path, parms, fallback);
 			return -1;
 		}
-		goto again;
-	} else if (ret < 0) {
-		pr_perror("Can't link remap to %s", path);
-		return -1;
 	}
 
 	if (note_link_remap(link_name, nsid))
@@ -1688,6 +1789,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	int ret;
 	FileEntry fe = FILE_ENTRY__INIT;
 	RegFileEntry rfe = REG_FILE_ENTRY__INIT;
+	bool skip_for_shell_job = false;
 
 	if (!p->link) {
 		if (fill_fdlink(lfd, p, &_link))
@@ -1715,6 +1817,15 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	}
 
 	if (mi && mnt_is_overmounted(mi)) {
+		if (opts.shell_job && is_tty(p->stat.st_rdev, p->stat.st_dev)) {
+			skip_for_shell_job = true;
+		} else {
+			pr_err("Can't lookup mount=%d for fd=%d path=%s\n", p->mnt_id, p->fd, link->name + 1);
+			return -1;
+		}
+	}
+
+	if (!skip_for_shell_job && mnt_is_overmounted(mi)) {
 		pr_err("Open files on overmounted mounts are not supported yet\n");
 		return -1;
 	}
@@ -1734,7 +1845,7 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 		return -1;
 	}
 
-	if (mi && check_path_remap(link, p, lfd, id, mi->nsid))
+	if (mi && !skip_for_shell_job && check_path_remap(link, p, lfd, id, mi->nsid))
 		return -1;
 	rfe.name = &link->name[1];
 ext:
@@ -2202,9 +2313,21 @@ ext:
 		if (!validate_file(tmp, &st, rfi))
 			goto err;
 
-		if (rfi->rfe->has_mode && (st.st_mode != rfi->rfe->mode)) {
-			pr_err("File %s has bad mode 0%o (expect 0%o)\n", rfi->path, (int)st.st_mode, rfi->rfe->mode);
-			goto err;
+		if (rfi->rfe->has_mode) {
+			mode_t curr_mode = st.st_mode;
+			mode_t saved_mode = rfi->rfe->mode;
+
+			if (opts.skip_file_rwx_check) {
+				curr_mode &= ~(S_IRWXU | S_IRWXG | S_IRWXO);
+				saved_mode &= ~(S_IRWXU | S_IRWXG | S_IRWXO);
+			}
+
+			if (curr_mode != saved_mode) {
+				pr_err("File %s has bad mode 0%o (expect 0%o)\n"
+				       "File r/w/x checks can be skipped with the --skip-file-rwx-check option\n",
+				       rfi->path, (int)curr_mode, saved_mode);
+				goto err;
+			}
 		}
 
 		/*

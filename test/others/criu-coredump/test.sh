@@ -1,11 +1,11 @@
 #!/bin/bash
 
 set -x
-# shellcheck disable=SC1091
+# shellcheck source=test/others/env.sh
 source ../env.sh || exit 1
 
 function gen_imgs {
-	PID=$(../loop)
+	PID=$(../loop with a very very very very very very very very very very very very long cmdline)
 	if ! $CRIU dump -v4 -o dump.log -D ./ -t "$PID"; then
 		echo "Failed to checkpoint process $PID"
 		cat dump.log

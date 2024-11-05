@@ -24,6 +24,49 @@
 #include "xmalloc.h"
 #include "util.h"
 
+char *task_comm_info(pid_t pid, char *comm, size_t size)
+{
+	bool is_read = false;
+
+	if (!pr_quelled(LOG_INFO)) {
+		int saved_errno = errno;
+		char path[32];
+		int fd;
+
+		snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+		fd = open(path, O_RDONLY);
+		if (fd >= 0) {
+			ssize_t n = read(fd, comm, size);
+			if (n > 0) {
+				is_read = true;
+				/* Replace '\n' printed by kernel with '\0' */
+				comm[n - 1] = '\0';
+			} else {
+				pr_warn("Failed to read %s: %s\n", path, strerror(errno));
+			}
+			close(fd);
+		} else {
+			pr_warn("Failed to open %s: %s\n", path, strerror(errno));
+		}
+		errno = saved_errno;
+	}
+
+	if (!is_read)
+		comm[0] = '\0';
+
+	return comm;
+}
+
+/*
+ * NOTE: Don't run simultaneously, it uses local static buffer!
+ */
+char *__task_comm_info(pid_t pid)
+{
+	static char comm[32];
+
+	return task_comm_info(pid, comm, sizeof(comm));
+}
+
 #define NR_ATTEMPTS 5
 
 static const char frozen[] = "FROZEN";
@@ -146,12 +189,12 @@ static int freezer_write_state(int fd, enum freezer_state new_state)
 	if (new_state == THAWED) {
 		if (cgroup_v2)
 			state[0] = '0';
-		else if (strlcpy(state, thawed, sizeof(state)) >= sizeof(state))
+		else if (__strlcpy(state, thawed, sizeof(state)) >= sizeof(state))
 			return -1;
 	} else if (new_state == FROZEN) {
 		if (cgroup_v2)
 			state[0] = '1';
-		else if (strlcpy(state, frozen, sizeof(state)) >= sizeof(state))
+		else if (__strlcpy(state, frozen, sizeof(state)) >= sizeof(state))
 			return -1;
 	} else {
 		return -1;
@@ -249,13 +292,13 @@ static int seize_cgroup_tree(char *root_path, enum freezer_state state)
 		if (ret == 0)
 			continue;
 		if (errno != ESRCH) {
-			pr_perror("Unexpected error");
+			pr_perror("Unexpected error for pid %d (comm %s)", pid, __task_comm_info(pid));
 			fclose(f);
 			return -1;
 		}
 
 		if (!compel_interrupt_task(pid)) {
-			pr_debug("SEIZE %d: success\n", pid);
+			pr_debug("SEIZE %d (comm %s): success\n", pid, __task_comm_info(pid));
 			processes_to_wait++;
 		} else if (state == FROZEN) {
 			char buf[] = "/proc/XXXXXXXXXX/exe";
@@ -272,7 +315,7 @@ static int seize_cgroup_tree(char *root_path, enum freezer_state state)
 			 * before it compete exit procedure. The caller simply
 			 * should wait a bit and try freezing again.
 			 */
-			pr_err("zombie found while seizing\n");
+			pr_err("zombie %d (comm %s) found while seizing\n", pid, __task_comm_info(pid));
 			fclose(f);
 			return -EAGAIN;
 		}
@@ -535,8 +578,10 @@ static int freeze_processes(void)
 	}
 
 err:
-	if (exit_code == 0 || origin_freezer_state == THAWED)
-		exit_code = freezer_write_state(fd, THAWED);
+	if (exit_code == 0 || origin_freezer_state == THAWED) {
+		if (freezer_write_state(fd, THAWED))
+			exit_code = -1;
+	}
 
 	if (close(fd)) {
 		pr_perror("Unable to thaw tasks");
@@ -615,6 +660,9 @@ static int collect_children(struct pstree_item *item)
 		else
 			processes_to_wait--;
 
+		if (ret == TASK_STOPPED)
+			c->pid->stop_signo = compel_parse_stop_signo(pid);
+
 		c->pid->real = pid;
 		c->parent = item;
 		c->pid->state = ret;
@@ -646,7 +694,7 @@ static void unseize_task_and_threads(const struct pstree_item *item, int st)
 	 * the item->state is the state task was in when we seized one.
 	 */
 
-	compel_resume_task(item->pid->real, item->pid->state, st);
+	compel_resume_task_sig(item->pid->real, item->pid->state, st, item->pid->stop_signo);
 
 	if (st == TASK_DEAD)
 		return;
@@ -949,6 +997,9 @@ int collect_pstree(void)
 		ret = TASK_DEAD;
 	else
 		processes_to_wait--;
+
+	if (ret == TASK_STOPPED)
+		root_item->pid->stop_signo = compel_parse_stop_signo(pid);
 
 	pr_info("Seized task %d, state %d\n", pid, ret);
 	root_item->pid->state = ret;

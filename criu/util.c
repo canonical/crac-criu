@@ -41,6 +41,7 @@
 #include "namespaces.h"
 #include "criu-log.h"
 #include "syscall.h"
+#include "util-caps.h"
 
 #include "clone-noasan.h"
 #include "cr_options.h"
@@ -1426,6 +1427,9 @@ void rlimit_unlimit_nofile(void)
 {
 	struct rlimit new;
 
+	if (opts.unprivileged && !has_cap_sys_resource(opts.cap_eff))
+		return;
+
 	new.rlim_cur = kdat.sysctl_nr_open;
 	new.rlim_max = kdat.sysctl_nr_open;
 
@@ -1590,44 +1594,46 @@ err:
 	return ret;
 }
 
-char *get_legacy_iptables_bin(bool ipv6)
+char *get_legacy_iptables_bin(bool ipv6, bool restore)
 {
-	static char iptables_bin[2][32];
+	static char iptables_bin[2][2][32];
 	/* 0  - means we don't know yet,
 	 * -1 - not present,
 	 * 1  - present.
 	 */
-	static int iptables_present[2] = { 0, 0 };
-	char bins[2][2][32] = { { "iptables-save", "iptables-legacy-save" },
-				{ "ip6tables-save", "ip6tables-legacy-save" } };
+	static int iptables_present[2][2] = { { 0, 0 }, { 0, 0 } };
+	char bins[2][2][2][32] = { { { "iptables-save", "iptables-legacy-save" },
+				     { "iptables-restore", "iptables-legacy-restore" } },
+				   { { "ip6tables-save", "ip6tables-legacy-save" },
+				     { "ip6tables-restore", "ip6tables-legacy-restore" } } };
 	int ret;
 
-	if (iptables_present[ipv6] == -1)
+	if (iptables_present[ipv6][restore] == -1)
 		return NULL;
 
-	if (iptables_present[ipv6] == 1)
-		return iptables_bin[ipv6];
+	if (iptables_present[ipv6][restore] == 1)
+		return iptables_bin[ipv6][restore];
 
-	memcpy(iptables_bin[ipv6], bins[ipv6][0], strlen(bins[ipv6][0]) + 1);
-	ret = is_iptables_nft(iptables_bin[ipv6]);
+	memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][0], strlen(bins[ipv6][restore][0]) + 1);
+	ret = is_iptables_nft(iptables_bin[ipv6][restore]);
 
 	/*
 	 * iptables on host uses nft backend (or not installed),
 	 * let's try iptables-legacy
 	 */
 	if (ret < 0 || ret == 1) {
-		memcpy(iptables_bin[ipv6], bins[ipv6][1], strlen(bins[ipv6][1]) + 1);
-		ret = is_iptables_nft(iptables_bin[ipv6]);
+		memcpy(iptables_bin[ipv6][restore], bins[ipv6][restore][1], strlen(bins[ipv6][restore][1]) + 1);
+		ret = is_iptables_nft(iptables_bin[ipv6][restore]);
 		if (ret < 0 || ret == 1) {
-			iptables_present[ipv6] = -1;
+			iptables_present[ipv6][restore] = -1;
 			return NULL;
 		}
 	}
 
 	/* we can come here with iptables-save or iptables-legacy-save */
-	iptables_present[ipv6] = 1;
+	iptables_present[ipv6][restore] = 1;
 
-	return iptables_bin[ipv6];
+	return iptables_bin[ipv6][restore];
 }
 
 /*
@@ -1872,7 +1878,7 @@ int run_command(char *buf, size_t buf_size, int (*child_fn)(void *), void *args)
 
 uint64_t criu_run_id;
 
-void util_init()
+void util_init(void)
 {
 	struct timespec tp;
 
@@ -2063,4 +2069,22 @@ out:
 	mp_path = xstrdup(mp_path);
 	xfree(free_path);
 	return mp_path;
+}
+
+int set_opts_cap_eff(void)
+{
+	struct __user_cap_header_struct cap_header;
+	struct __user_cap_data_struct cap_data[_LINUX_CAPABILITY_U32S_3];
+	int i;
+
+	cap_header.version = _LINUX_CAPABILITY_VERSION_3;
+	cap_header.pid = getpid();
+
+	if (capget(&cap_header, &cap_data[0]))
+		return -1;
+
+	for (i = 0; i < _LINUX_CAPABILITY_U32S_3; i++)
+		memcpy(&opts.cap_eff[i], &cap_data[i].effective, sizeof(u32));
+
+	return 0;
 }

@@ -17,6 +17,7 @@
 #include <sys/resource.h>
 #include <signal.h>
 #include <sys/inotify.h>
+#include <sys/socket.h>
 
 #include "linux/userfaultfd.h"
 
@@ -209,7 +210,7 @@ static int lsm_set_label(char *label, char *type, int procfd)
 	return 0;
 }
 
-static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type)
+static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_type, uid_t uid)
 {
 	CredsEntry *ce = &args->creds;
 	int b, i, ret;
@@ -236,10 +237,12 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 	 * lose caps bits when changing xids.
 	 */
 
-	ret = sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
-	if (ret) {
-		pr_warn("Unable to set SECURE_NO_SETUID_FIXUP: %d\n", ret);
-		return -1;
+	if (!uid) {
+		ret = sys_prctl(PR_SET_SECUREBITS, 1 << SECURE_NO_SETUID_FIXUP, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set SECURE_NO_SETUID_FIXUP: %d\n", ret);
+			return -1;
+		}
 	}
 
 	/*
@@ -277,10 +280,12 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 	 * special state any longer.
 	 */
 
-	ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
-	if (ret) {
-		pr_warn("Unable to set PR_SET_SECUREBITS: %d\n", ret);
-		return -1;
+	if (!uid) {
+		ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set PR_SET_SECUREBITS: %d\n", ret);
+			return -1;
+		}
 	}
 
 	/*
@@ -607,6 +612,103 @@ static void noinline rst_sigreturn(unsigned long new_sp, struct rt_sigframe *sig
 	ARCH_RT_SIGRETURN(new_sp, sigframe);
 }
 
+static int send_cg_set(int sk, int cg_set)
+{
+	struct cmsghdr *ch;
+	struct msghdr h;
+	/*
+	 * 0th is the dummy call address for compatibility with userns helper
+	 * 1st is the cg_set
+	 */
+	struct iovec iov[2];
+	char cmsg[CMSG_SPACE(sizeof(struct ucred))] = {};
+	int ret, *dummy = NULL;
+	struct ucred *ucred;
+
+	iov[0].iov_base = &dummy;
+	iov[0].iov_len = sizeof(dummy);
+	iov[1].iov_base = &cg_set;
+	iov[1].iov_len = sizeof(cg_set);
+
+	h.msg_iov = iov;
+	h.msg_iovlen = sizeof(iov) / sizeof(struct iovec);
+	h.msg_name = NULL;
+	h.msg_namelen = 0;
+	h.msg_flags = 0;
+
+	h.msg_control = cmsg;
+	h.msg_controllen = sizeof(cmsg);
+	ch = CMSG_FIRSTHDR(&h);
+	ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+	ch->cmsg_level = SOL_SOCKET;
+	ch->cmsg_type = SCM_CREDENTIALS;
+
+	ucred = (struct ucred *)CMSG_DATA(ch);
+	/*
+	 * We still have privilege in this namespace so we can send
+	 * thread id instead of pid of main thread, uid, gid as 0
+	 * since these 2 are ignored in cgroupd
+	 */
+	ucred->pid = sys_gettid();
+	ucred->uid = 0;
+	ucred->gid = 0;
+
+	ret = sys_sendmsg(sk, &h, 0);
+	if (ret < 0) {
+		pr_err("Unable to send packet to cgroupd %d\n", ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * As this socket is shared among threads, recvmsg(MSG_PEEK)
+ * from the socket until getting its own thread id as an
+ * acknowledge of successful threaded cgroup fixup
+ */
+static int recv_cg_set_restore_ack(int sk)
+{
+	struct cmsghdr *ch;
+	struct msghdr h = {};
+	char cmsg[CMSG_SPACE(sizeof(struct ucred))];
+	struct ucred *cred;
+	int ret;
+
+	h.msg_control = cmsg;
+	h.msg_controllen = sizeof(cmsg);
+
+	while (1) {
+		ret = sys_recvmsg(sk, &h, MSG_PEEK);
+		if (ret < 0) {
+			pr_err("Unable to peek from cgroupd %d\n", ret);
+			return -1;
+		}
+
+		if (h.msg_controllen != sizeof(cmsg)) {
+			pr_err("The message from cgroupd is truncated\n");
+			return -1;
+		}
+
+		ch = CMSG_FIRSTHDR(&h);
+		cred = (struct ucred *)CMSG_DATA(ch);
+		if (cred->pid != sys_gettid())
+			continue;
+
+		/*
+		 * Actual remove message from recv queue of socket
+		 */
+		ret = sys_recvmsg(sk, &h, 0);
+		if (ret < 0) {
+			pr_err("Unable to receive from cgroupd %d\n", ret);
+			return -1;
+		}
+
+		break;
+	}
+	return 0;
+}
+
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
@@ -639,6 +741,15 @@ long __export_restore_thread(struct thread_restore_args *args)
 
 	rt_sigframe = (void *)&args->mz->rt_sigframe;
 
+	if (args->cg_set != -1) {
+		pr_info("Restore cg_set in thread cg_set: %d\n", args->cg_set);
+		if (send_cg_set(args->cgroupd_sk, args->cg_set))
+			goto core_restore_end;
+		if (recv_cg_set_restore_ack(args->cgroupd_sk))
+			goto core_restore_end;
+		sys_close(args->cgroupd_sk);
+	}
+
 	if (restore_thread_common(args))
 		goto core_restore_end;
 
@@ -663,14 +774,11 @@ long __export_restore_thread(struct thread_restore_args *args)
 	if (restore_seccomp(args))
 		BUG();
 
-	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type);
-	ret = restore_dumpable_flag(&args->ta->mm) || ret;
-	ret = restore_pdeath_sig(args) || ret;
-
-	if (ret) {
-		pr_warn("Restore thread error %d\n", ret);
-		ret = 0;
-	}
+	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
+	ret = ret || restore_dumpable_flag(&args->ta->mm);
+	ret = ret || restore_pdeath_sig(args);
+	if (ret)
+		BUG();
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
@@ -1788,7 +1896,38 @@ long __export_restore_task(struct task_restore_args *args)
 		ret |= sys_prctl_mm_set_range("MM_ENV",
 				PR_SET_MM_ENV_START,	(long)args->mm.mm_env_start,
 				PR_SET_MM_ENV_END,	(long)args->mm.mm_env_end);
+        }
 
+	if (ret) {
+		pr_debug("prctl PR_SET_MM_MAP failed with %d\n", (int)ret);
+		pr_debug("  .start_code = %" PRIx64 "\n", prctl_map.start_code);
+		pr_debug("  .end_code = %" PRIx64 "\n", prctl_map.end_code);
+		pr_debug("  .start_data = %" PRIx64 "\n", prctl_map.start_data);
+		pr_debug("  .end_data = %" PRIx64 "\n", prctl_map.end_data);
+		pr_debug("  .start_stack = %" PRIx64 "\n", prctl_map.start_stack);
+		pr_debug("  .start_brk = %" PRIx64 "\n", prctl_map.start_brk);
+		pr_debug("  .brk = %" PRIx64 "\n", prctl_map.brk);
+		pr_debug("  .arg_start = %" PRIx64 "\n", prctl_map.arg_start);
+		pr_debug("  .arg_end = %" PRIx64 "\n", prctl_map.arg_end);
+		pr_debug("  .env_start = %" PRIx64 "\n", prctl_map.env_start);
+		pr_debug("  .env_end = %" PRIx64 "\n", prctl_map.env_end);
+		pr_debug("  .auxv_size = %" PRIu32 "\n", prctl_map.auxv_size);
+		for (i = 0; i < prctl_map.auxv_size / sizeof(uint64_t); i++)
+			pr_debug("  .auxv[%d] = %" PRIx64 "\n", i, prctl_map.auxv[i]);
+		pr_debug("  .exe_fd = %" PRIu32 "\n", prctl_map.exe_fd);
+	}
+	if (ret == -EINVAL) {
+		ret = sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_CODE, (long)args->mm.mm_start_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_CODE, (long)args->mm.mm_end_code, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_DATA, (long)args->mm.mm_start_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_END_DATA, (long)args->mm.mm_end_data, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_STACK, (long)args->mm.mm_start_stack, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_START_BRK, (long)args->mm.mm_start_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_BRK, (long)args->mm.mm_brk, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_START, (long)args->mm.mm_arg_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ARG_END, (long)args->mm.mm_arg_end, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_START, (long)args->mm.mm_env_start, 0);
+		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_ENV_END, (long)args->mm.mm_env_end, 0);
 		ret |= sys_prctl_safe(PR_SET_MM, PR_SET_MM_AUXV, (long)args->mm_saved_auxv, args->mm_saved_auxv_size);
 
 		/*
@@ -1916,6 +2055,7 @@ long __export_restore_task(struct task_restore_args *args)
 			}
 			if (ret != thread_args[i].pid) {
 				pr_err("Unable to create a thread: %ld\n", ret);
+				sys_close(fd);
 				mutex_unlock(&task_entries_local->last_pid_mutex);
 				goto core_restore_end;
 			}
@@ -2000,10 +2140,10 @@ long __export_restore_task(struct task_restore_args *args)
 	 * turning off TCP repair is CAP_SYS_NED_ADMIN protected,
 	 * thus restore* creds _after_ all of the above.
 	 */
-	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type);
-	ret = restore_dumpable_flag(&args->mm) || ret;
-	ret = restore_pdeath_sig(args->t) || ret;
-	ret = restore_child_subreaper(args->child_subreaper) || ret;
+	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type, args->uid);
+	ret = ret || restore_dumpable_flag(&args->mm);
+	ret = ret || restore_pdeath_sig(args->t);
+	ret = ret || restore_child_subreaper(args->child_subreaper);
 
 	futex_set_and_wake(&thread_inprogress, args->nr_threads);
 

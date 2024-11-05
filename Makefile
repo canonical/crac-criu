@@ -441,21 +441,23 @@ lint:
 	flake8 --config=scripts/flake8.cfg test/inhfd/*.py
 	flake8 --config=scripts/flake8.cfg test/others/rpc/config_file.py
 	flake8 --config=scripts/flake8.cfg lib/py/images/pb2dict.py
+	flake8 --config=scripts/flake8.cfg lib/py/images/images.py
 	flake8 --config=scripts/flake8.cfg scripts/criu-ns
-	flake8 --config=scripts/flake8.cfg scripts/crit-setup.py
+	flake8 --config=scripts/flake8.cfg crit/setup.py
+	flake8 --config=scripts/flake8.cfg scripts/uninstall_module.py
 	flake8 --config=scripts/flake8.cfg coredump/
 	shellcheck --version
 	shellcheck scripts/*.sh
 	shellcheck scripts/ci/*.sh scripts/ci/apt-install
-	shellcheck test/others/crit/*.sh
-	shellcheck test/others/libcriu/*.sh
-	shellcheck test/others/crit/*.sh test/others/criu-coredump/*.sh
-	shellcheck test/others/config-file/*.sh
-	codespell
+	shellcheck -x test/others/crit/*.sh
+	shellcheck -x test/others/libcriu/*.sh
+	shellcheck -x test/others/crit/*.sh test/others/criu-coredump/*.sh
+	shellcheck -x test/others/config-file/*.sh
+	codespell -S tags
 	# Do not append \n to pr_perror or fail
 	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*\\n"'
 	# Do not use %m with pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*%m'
+	! git --no-pager grep -E '^\s*\<(pr_(err|perror|warn|debug|info|msg)|fail)\>.*%m'
 	# Do not use errno with pr_perror or fail
 	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>\(".*".*errno'
 	# End pr_(err|warn|msg|info|debug) with \n
@@ -475,8 +477,10 @@ fetch-clang-format: .FORCE
 	$(E) ".clang-format"
 	$(Q) scripts/fetch-clang-format.sh
 
+BASE ?= "HEAD~1"
+OPTS ?= "--quiet"
 indent:
-	find . -name '*.[ch]' -type f -print0 | xargs --null --max-args 128 --max-procs 4 clang-format -i
+	git clang-format --style file --extensions c,h $(OPTS) $(BASE)
 .PHONY: indent
 
 include Makefile.install

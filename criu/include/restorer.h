@@ -121,6 +121,8 @@ struct thread_restore_args {
 	bool seccomp_force_tsync;
 
 	char comm[TASK_COMM_LEN];
+	int cg_set;
+	int cgroupd_sk;
 } __aligned(64);
 
 typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
@@ -237,6 +239,9 @@ struct task_restore_args {
 	 * unregister it before memory restoration procedure
 	 */
 	struct rst_rseq_param libc_rseq;
+
+	uid_t uid;
+	u32 cap_eff[CR_CAP_SIZE];
 } __aligned(64);
 
 /*

@@ -1,4 +1,4 @@
-FROM docker.io/library/eclipse-temurin:8-focal
+FROM docker.io/library/ibm-semeru-runtimes:open-11-jdk-focal
 ARG CC=gcc
 
 COPY scripts/ci/apt-install /bin/apt-install
@@ -31,4 +31,3 @@ WORKDIR /criu
 RUN make mrproper && make -j $(nproc) CC="$CC"
 
 ENTRYPOINT mvn -q -f test/javaTests/pom.xml test
-

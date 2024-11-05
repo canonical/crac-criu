@@ -13,6 +13,9 @@
 #include "rst-malloc.h"
 #include "log.h"
 #include "util.h"
+#include "cr_options.h"
+#include "util-caps.h"
+#include "sockets.h"
 
 /* clang-format off */
 static struct fdstore_desc {
@@ -49,9 +52,9 @@ int fdstore_init(void)
 		return -1;
 	}
 
-	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &buf[0], sizeof(buf[0])) < 0 ||
-	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &buf[1], sizeof(buf[1])) < 0) {
-		pr_warn("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE: %m\n");
+	if (sk_setbufs(sk, buf)) {
+		close(sk);
+		return -1;
 	}
 
 	addr.sun_family = AF_UNIX;
