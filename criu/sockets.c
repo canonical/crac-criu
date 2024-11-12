@@ -469,10 +469,13 @@ int do_restore_opt(int sk, int level, int name, void *val, int len)
 int sk_setbufs(int sk, uint32_t *bufs)
 {
 	uint32_t sndbuf = bufs[0], rcvbuf = bufs[1];
-        pr_perror("sk_setbufs");
 	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
 	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
-		if (opts.unprivileged) {
+                /* We should ideally run criu with --unprivileged in containers.
+                 * But while the openjdk-crac packages are updated to do that,
+                 * here is a workaround - retry on EPERM.
+                 */
+		if (opts.unprivileged || errno == EPERM) {
 			pr_info("Unable to set SO_SNDBUFFORCE/SO_RCVBUFFORCE, falling back to SO_SNDBUF/SO_RCVBUF\n");
 			if (setsockopt(sk, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) ||
 			    setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf))) {
