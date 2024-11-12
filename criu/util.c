@@ -24,7 +24,6 @@
 #include <sys/resource.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sched.h>
 #include <ftw.h>
 #include <time.h>
@@ -662,38 +661,52 @@ out:
 	return ret;
 }
 
+struct child_args {
+	int *sk_pair;
+	int (*child_setup)(void);
+};
+
+static int child_func(void *_args)
+{
+	struct child_args *args = _args;
+	int sk, *sk_pair = args->sk_pair;
+	char c = 0;
+
+	sk = sk_pair[1];
+	close(sk_pair[0]);
+
+	if (args->child_setup && args->child_setup() != 0)
+		exit(1);
+
+	if (write(sk, &c, 1) != 1) {
+		pr_perror("write");
+		exit(1);
+	}
+
+	while (1)
+		sleep(1000);
+	exit(1);
+}
+
 pid_t fork_and_ptrace_attach(int (*child_setup)(void))
 {
 	pid_t pid;
 	int sk_pair[2], sk;
 	char c = 0;
+	struct child_args cargs = {
+		.sk_pair = sk_pair,
+		.child_setup = child_setup,
+	};
 
 	if (socketpair(PF_LOCAL, SOCK_SEQPACKET, 0, sk_pair)) {
 		pr_perror("socketpair");
 		return -1;
 	}
 
-	pid = fork();
+	pid = clone_noasan(child_func, CLONE_UNTRACED | SIGCHLD, &cargs);
 	if (pid < 0) {
 		pr_perror("fork");
 		return -1;
-	}
-
-	if (pid == 0) {
-		sk = sk_pair[1];
-		close(sk_pair[0]);
-
-		if (child_setup && child_setup() != 0)
-			exit(1);
-
-		if (write(sk, &c, 1) != 1) {
-			pr_perror("write");
-			exit(1);
-		}
-
-		while (1)
-			sleep(1000);
-		exit(1);
 	}
 
 	sk = sk_pair[0];
@@ -952,6 +965,89 @@ FILE *fopenat(int dirfd, char *path, char *cflags)
 	return fdopen(tmp, cflags);
 }
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid)
+{
+	struct stat st;
+
+	if (!fchown(fd, new_uid, new_gid))
+		return 0;
+	if (errno != EPERM)
+		return -1;
+
+	if (fstat(fd, &st) < 0) {
+		pr_perror("fstat() after fchown() for fd %d", fd);
+		goto out_eperm;
+	}
+	pr_debug("fstat(%d): uid %u gid %u\n", fd, st.st_uid, st.st_gid);
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid)
+		goto out_eperm;
+
+	return 0;
+out_eperm:
+	errno = EPERM;
+	return -1;
+}
+
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags)
+{
+	struct stat st;
+	int ret;
+
+	if (fchownat(dirfd, path, new_uid, new_gid, flags) < 0 && errno != EPERM) {
+		int errno_cpy = errno;
+		pr_perror("Unable to change [%d]/%s ownership to (%d, %d)",
+			  dirfd, path, new_uid, new_gid);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (fstatat(dirfd, path, &st, flags) < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to stat [%d]/%s", dirfd, path);
+		errno = errno_cpy;
+		return -1;
+	}
+
+	if (new_uid != st.st_uid || new_gid != st.st_gid) {
+		errno = EPERM;
+		pr_perror("Unable to change [%d]/%s ownership (%d, %d) to (%d, %d)",
+			  dirfd, path, st.st_uid, st.st_gid, new_uid, new_gid);
+		errno = EPERM;
+		return -1;
+	}
+
+	if (new_mode == st.st_mode)
+		return 0;
+
+	if (S_ISLNK(st.st_mode)) {
+		/*
+		 * We have no lchmod() function, and fchmod() will fail on
+		 * O_PATH | O_NOFOLLOW fd. Yes, we have fchmodat()
+		 * function and flag AT_SYMLINK_NOFOLLOW described in
+		 * man 2 fchmodat, but it is not currently implemented. %)
+		 */
+		return 0;
+	}
+
+	if (!*path && flags & AT_EMPTY_PATH)
+		ret = fchmod(dirfd, new_mode);
+	else
+		ret = fchmodat(dirfd, path, new_mode, flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH));
+	if (ret < 0) {
+		int errno_cpy = errno;
+		pr_perror("Unable to set perms %o on [%d]/%s", new_mode, dirfd, path);
+		errno = errno_cpy;
+	}
+
+	return ret;
+}
+
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode)
+{
+	return cr_fchpermat(fd, "", new_uid, new_gid, new_mode, AT_EMPTY_PATH);
+}
+
 void split(char *str, char token, char ***out, int *n)
 {
 	int i;
@@ -1070,20 +1166,6 @@ const char *ns_to_string(unsigned int ns)
 	default:
 		return NULL;
 	}
-}
-
-void tcp_cork(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_CORK, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_CORK (%d)", val);
-}
-
-void tcp_nodelay(int sk, bool on)
-{
-	int val = on ? 1 : 0;
-	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
-		pr_perror("Unable to restore TCP_NODELAY (%d)", val);
 }
 
 static int get_sockaddr_in(struct sockaddr_storage *addr, char *host, unsigned short port)
@@ -1566,7 +1648,7 @@ static int is_iptables_nft(char *bin)
 		goto err;
 	}
 
-	ret = cr_system(-1, pfd[1], -1, cmd[0], cmd, 0);
+	ret = cr_system(-1, pfd[1], -1, cmd[0], cmd, CRS_CAN_FAIL);
 	if (ret) {
 		pr_err("%s -V failed\n", cmd[0]);
 		goto err;
@@ -1880,11 +1962,16 @@ uint64_t criu_run_id;
 
 void util_init(void)
 {
-	struct timespec tp;
+	struct stat statbuf;
 
-	clock_gettime(CLOCK_MONOTONIC, &tp);
-	criu_run_id = ((uint64_t)getpid() << 32) + tp.tv_sec + tp.tv_nsec;
+	criu_run_id = getpid();
+	if (!stat("/proc/self/ns/pid", &statbuf))
+		criu_run_id |= (uint64_t)statbuf.st_ino << 32;
+	else if (errno != ENOENT)
+		pr_perror("Can't stat /proc/self/ns/pid - CRIU run id might not be unique");
+
 	compel_run_id = criu_run_id;
+	pr_info("CRIU run id = %#" PRIx64 "\n", criu_run_id);
 }
 
 /*

@@ -772,6 +772,11 @@ static int dump_task_core_all(struct parasite_ctl *ctl, struct pstree_item *item
 	core->tc->child_subreaper = misc->child_subreaper;
 	core->tc->has_child_subreaper = true;
 
+	if (misc->membarrier_registration_mask) {
+		core->tc->membarrier_registration_mask = misc->membarrier_registration_mask;
+		core->tc->has_membarrier_registration_mask = true;
+	}
+
 	ret = get_task_personality(pid, &core->tc->personality);
 	if (ret < 0)
 		goto err;
@@ -2188,6 +2193,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	if (network_lock())
+		goto err;
+
+	if (rpc_query_external_files())
 		goto err;
 
 	if (collect_file_locks())

@@ -111,15 +111,18 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	}
 
 	rlen = read(fd, buf, len);
+	if (rlen == -1)
+		pr_perror("Can't read ns' %s", path);
 	close(fd);
 
 	if (rlen == len) {
+		buf[0] = '\0';
 		pr_err("Too small buffer to read ns sys file %s\n", path);
 		return -1;
 	}
 
-	if (rlen > 0)
-		buf[rlen - 1] = '\0';
+	if (rlen >= 0)
+		buf[rlen] = '\0';
 
 	return rlen;
 }
@@ -3134,6 +3137,9 @@ int network_lock_internal(void)
 {
 	int ret = 0, nsret;
 
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
+
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
@@ -3195,6 +3201,9 @@ static int iptables_network_unlock_internal(void)
 static int network_unlock_internal(void)
 {
 	int ret = 0, nsret;
+
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
 
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
@@ -3268,7 +3277,7 @@ int macvlan_ext_add(struct external *ext)
 /*
  * The setns() syscall (called by switch_ns()) can be extremely
  * slow. If we call it two or more times from the same task the
- * kernel will synchonously go on a very slow routine called
+ * kernel will synchronously go on a very slow routine called
  * synchronize_rcu() trying to put a reference on old namespaces.
  *
  * To avoid doing this more than once we pre-create all the
@@ -3436,7 +3445,7 @@ struct ns_id *net_get_root_ns(void)
 
 /*
  * socket_diag doesn't report unbound and unconnected sockets,
- * so we have to get their network namesapces explicitly
+ * so we have to get their network namespaces explicitly
  */
 struct ns_id *get_socket_ns(int lfd)
 {

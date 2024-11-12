@@ -72,7 +72,6 @@ struct thread_creds_args {
 	u32 cap_eff[CR_CAP_SIZE];
 	u32 cap_bnd[CR_CAP_SIZE];
 
-	unsigned int secbits;
 	char *lsm_profile;
 	unsigned int *groups;
 	char *lsm_sockcreate;
@@ -144,7 +143,7 @@ struct task_restore_args {
 	struct timeval logstart;
 
 	int uffd;
-	bool has_thp_enabled;
+	bool thp_disabled;
 
 	/* threads restoration */
 	int nr_threads;				 /* number of threads */
@@ -230,6 +229,7 @@ struct task_restore_args {
 #endif
 	int lsm_type;
 	int child_subreaper;
+	int membarrier_registration_mask;
 	bool has_clone3_set_tid;
 	bool mmap_page_image;
 	bool ptrace_allowed;

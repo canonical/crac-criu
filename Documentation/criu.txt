@@ -155,6 +155,11 @@ not compatible with *--external* *dev*.
             notification message contains a file descriptor for
             the master pty
 
+        *query-ext-files*:::
+            called after the process tree is stopped and network is locked.
+            This hook is used only in the RPC mode. The notification reply
+            contains file ids to be added to external file list (may be empty).
+
 *--unprivileged*::
     This option tells *criu* to accept the limitations when running
     as non-root. Running as non-root requires *criu* at least to have
@@ -456,6 +461,9 @@ The 'mode' may be one of the following:
     This is the default if 'mode' is not specified.
 
     *nftables*::: Use nftables rules to drop the packets.
+
+    *skip*::: Don't lock the network. If *--tcp-close* is not used, the network
+    must be locked externally to allow CRIU to dump TCP connections.
 
 *restore*
 ~~~~~~~~~

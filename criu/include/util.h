@@ -263,6 +263,10 @@ bool is_path_prefix(const char *path, const char *prefix);
 FILE *fopenat(int dirfd, char *path, char *cflags);
 void split(char *str, char token, char ***out, int *n);
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid);
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode);
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags);
+
 int fd_has_data(int lfd);
 
 int make_yard(char *path);
@@ -274,8 +278,6 @@ static inline int sk_wait_data(int sk)
 }
 
 void fd_set_nonblocking(int fd, bool on);
-void tcp_nodelay(int sk, bool on);
-void tcp_cork(int sk, bool on);
 
 const char *ns_to_string(unsigned int ns);
 

@@ -12,11 +12,12 @@
 #include <sys/sysmacros.h>
 #include <stdint.h>
 #include <sys/socket.h>
-#include <arpa/inet.h> /* for sockaddr_in and inet_ntoa() */
+#include <netinet/in.h>
 #include <sys/prctl.h>
 #include <sys/inotify.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <linux/membarrier.h>
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 #include <nftables/libnftables.h>
@@ -55,10 +56,11 @@
 #include "util-caps.h"
 
 struct kerndat_s kdat = {};
+volatile int dummy_var;
 
 static int check_pagemap(void)
 {
-	int ret, fd;
+	int ret, fd, retry;
 	u64 pfn = 0;
 
 	fd = __open_proc(PROC_SELF, EPERM, O_RDONLY, "pagemap");
@@ -72,11 +74,25 @@ static int check_pagemap(void)
 		return -1;
 	}
 
-	/* Get the PFN of some present page. Stack is here, so try it :) */
-	ret = pread(fd, &pfn, sizeof(pfn), (((unsigned long)&ret) / page_size()) * sizeof(pfn));
-	if (ret != sizeof(pfn)) {
-		pr_perror("Can't read pagemap");
-		return -1;
+	retry = 3;
+	while (retry--) {
+		++dummy_var;
+		/* Get the PFN of a page likely to be present. */
+		ret = pread(fd, &pfn, sizeof(pfn), PAGE_PFN((uintptr_t)&dummy_var) * sizeof(pfn));
+		if (ret != sizeof(pfn)) {
+			pr_perror("Can't read pagemap");
+			close(fd);
+			return -1;
+		}
+		/* The page can be swapped out by the time the read occurs,
+		 * in which case the rest of the bits are a swap type + offset
+		 * (which could be zero even if not hidden).
+		 * Retry if this happens. */
+		if (pfn & PME_PRESENT)
+			break;
+		pr_warn("got non-present PFN %#lx for the dummy data page; %s\n", (unsigned long)pfn,
+			retry ? "retrying" : "giving up");
+		pfn = 0;
 	}
 
 	close(fd);
@@ -465,8 +481,15 @@ static int get_last_cap(void)
 	struct sysctl_req req[] = {
 		{ "kernel/cap_last_cap", &kdat.last_cap, CTL_U32 },
 	};
+	int ret;
 
-	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
+	if (ret || kdat.last_cap < 32 * CR_CAP_SIZE)
+		return ret;
+
+	pr_err("Kernel reports more capabilities than this CRIU supports: %u > %u\n",
+	       kdat.last_cap, 32 * CR_CAP_SIZE - 1);
+	return -1;
 }
 
 static bool kerndat_has_memfd_create(void)
@@ -615,29 +638,52 @@ static int kerndat_iptables_has_xtlocks(void)
 	return 0;
 }
 
-int kerndat_tcp_repair(void)
-{
-	int sock, clnt = -1, yes = 1, exit_code = -1;
-	struct sockaddr_in addr;
-	socklen_t aux;
+/*
+ * Unfortunately in C htonl() is not constexpr and cannot be used in a static
+ * initialization below.
+ */
+#define constant_htonl(x) \
+	(__BYTE_ORDER == __BIG_ENDIAN ? (x) : \
+		(((x) & 0xff000000) >> 24) | (((x) & 0x00ff0000) >>  8) | \
+		(((x) & 0x0000ff00) <<  8) | (((x) & 0x000000ff) << 24))
 
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	inet_pton(AF_INET, "127.0.0.1", &(addr.sin_addr));
-	addr.sin_port = 0;
+static int kerndat_tcp_repair(void)
+{
+	static const struct sockaddr_in loopback_ip4 = {
+		.sin_family = AF_INET,
+		.sin_port = 0,
+		.sin_addr = { constant_htonl(INADDR_LOOPBACK) },
+	};
+	static const struct sockaddr_in6 loopback_ip6 = {
+		.sin6_family = AF_INET6,
+		.sin6_port = 0,
+		.sin6_addr = IN6ADDR_LOOPBACK_INIT,
+	};
+	int sock, clnt = -1, yes = 1, exit_code = -1;
+	const struct sockaddr *addr;
+	struct sockaddr_storage listener_addr;
+	socklen_t addrlen;
+
+	addr = (const struct sockaddr *)&loopback_ip4;
+	addrlen = sizeof(loopback_ip4);
 	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0 && errno == EAFNOSUPPORT) {
+		addr = (const struct sockaddr *)&loopback_ip6;
+		addrlen = sizeof(loopback_ip6);
+		sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	}
 	if (sock < 0) {
 		pr_perror("Unable to create a socket");
 		return -1;
 	}
 
-	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
+	if (bind(sock, addr, addrlen)) {
 		pr_perror("Unable to bind a socket");
 		goto err;
 	}
 
-	aux = sizeof(addr);
-	if (getsockname(sock, (struct sockaddr *)&addr, &aux)) {
+	addrlen = sizeof(listener_addr);
+	if (getsockname(sock, (struct sockaddr *)&listener_addr, &addrlen)) {
 		pr_perror("Unable to get a socket name");
 		goto err;
 	}
@@ -647,13 +693,13 @@ int kerndat_tcp_repair(void)
 		goto err;
 	}
 
-	clnt = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	clnt = socket(addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
 	if (clnt < 0) {
 		pr_perror("Unable to create a socket");
 		goto err;
 	}
 
-	if (connect(clnt, (struct sockaddr *)&addr, sizeof(addr))) {
+	if (connect(clnt, (const struct sockaddr *)&listener_addr, addrlen)) {
 		pr_perror("Unable to connect a socket");
 		goto err;
 	}
@@ -680,20 +726,22 @@ err:
 	return exit_code;
 }
 
-int kerndat_nsid(void)
+static int kerndat_nsid(void)
 {
 	int nsid, sk;
 
+	kdat.has_nsid = false;
+
 	sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (sk < 0) {
-		pr_perror("Unable to create a netlink socket");
-		return -1;
+		pr_pwarn("Unable to create a netlink socket: NSID can't be used.");
+		return 0;
 	}
 
 	if (net_get_nsid(sk, getpid(), &nsid) < 0) {
-		pr_err("NSID is not supported\n");
+		pr_warn("NSID is not supported\n");
 		close(sk);
-		return -1;
+		return 0;
 	}
 
 	kdat.has_nsid = true;
@@ -986,6 +1034,8 @@ int kerndat_sockopt_buf_lock(void)
 	int sock;
 
 	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0 && errno == EAFNOSUPPORT)
+		sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
 	if (sock < 0) {
 		pr_perror("Unable to create a socket");
 		return -1;
@@ -1337,6 +1387,8 @@ int kerndat_has_thp_disable(void)
 
 			parse_vmflags(str, &flags, &madv, &io_pf);
 			kdat.has_thp_disable = !(madv & (1 << MADV_NOHUGEPAGE));
+			if (!kdat.has_thp_disable)
+				pr_warn("prctl PR_SET_THP_DISABLE sets MADV_NOHUGEPAGE\n");
 			break;
 		}
 	}
@@ -1380,16 +1432,21 @@ static bool kerndat_has_clone3_set_tid(void)
 	 */
 	pid = syscall(__NR_clone3, &args, sizeof(args));
 
-	if (pid == -1 && (errno == ENOSYS || errno == E2BIG)) {
-		kdat.has_clone3_set_tid = false;
-		return 0;
-	}
-	if (pid == -1 && errno == EINVAL) {
-		kdat.has_clone3_set_tid = true;
-	} else if (pid == -1 && errno != EPERM) {
-		pr_perror("Unexpected error from clone3");
+	if (pid != -1) {
+		pr_err("Unexpected success: clone3() returned %d\n", pid);
 		return -1;
 	}
+
+	if (errno == ENOSYS || errno == E2BIG)
+		return 0;
+
+	if (errno != EINVAL) {
+		pr_pwarn("Unexpected error from clone3");
+		return 0;
+	}
+
+        if (errno != EPERM)
+		kdat.has_clone3_set_tid = true;
 
 	return 0;
 }
@@ -1558,17 +1615,10 @@ static int kerndat_has_nftables_concat(void)
 #define IPV6_FREEBIND 78
 #endif
 
-static int kerndat_has_ipv6_freebind(void)
+static int __kerndat_has_ipv6_freebind(int sk)
 {
-	int sk, val;
+	int val = 1;
 
-	sk = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-	if (sk == -1) {
-		pr_perror("Unable to create a ipv6 dgram socket");
-		return -1;
-	}
-
-	val = 1;
 	if (setsockopt(sk, SOL_IPV6, IPV6_FREEBIND, &val, sizeof(int)) == -1) {
 		if (errno == ENOPROTOOPT) {
 			kdat.has_ipv6_freebind = false;
@@ -1579,6 +1629,44 @@ static int kerndat_has_ipv6_freebind(void)
 	}
 
 	kdat.has_ipv6_freebind = true;
+	return 0;
+}
+
+static int kerndat_has_ipv6_freebind(void)
+{
+	int sk, ret;
+
+	if (!kdat.ipv6) {
+		kdat.has_ipv6_freebind = false;
+		return 0;
+	}
+
+	sk = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if (sk == -1) {
+		pr_perror("Unable to create a ipv6 dgram socket");
+		return -1;
+	}
+
+	ret = __kerndat_has_ipv6_freebind(sk);
+	close(sk);
+	return ret;
+}
+
+#define MEMBARRIER_CMDBIT_GET_REGISTRATIONS 9
+
+static int kerndat_has_membarrier_get_registrations(void)
+{
+	int ret = syscall(__NR_membarrier, 1 << MEMBARRIER_CMDBIT_GET_REGISTRATIONS, 0);
+	if (ret < 0) {
+		if (errno != EINVAL) {
+			return ret;
+		}
+
+		kdat.has_membarrier_get_registrations = false;
+	} else {
+		kdat.has_membarrier_get_registrations = true;
+	}
+
 	return 0;
 }
 
@@ -1823,6 +1911,10 @@ int kerndat_init(void)
 	}
 	if (!ret && (kerndat_has_ipv6_freebind() < 0)) {
 		pr_err("kerndat_has_ipv6_freebind failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_membarrier_get_registrations()) {
+		pr_err("kerndat_has_membarrier_get_registrations failed when initializing kerndat.\n");
 		ret = -1;
 	}
 

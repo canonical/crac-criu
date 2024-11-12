@@ -51,6 +51,17 @@
 #include "shmem.h"
 #include "restorer.h"
 
+/*
+ * sys_getgroups() buffer size. Not too much, to avoid stack overflow.
+ */
+#define MAX_GETGROUPS_CHECKED (512 / sizeof(unsigned int))
+
+/*
+ * Memory overhead limit for reading VMA when auto_dedup is enabled.
+ * An arbitrarily chosen trade-off point between speed and memory usage.
+ */
+#define AUTO_DEDUP_OVERHEAD_BYTES (128 << 20)
+
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
 #endif
@@ -118,7 +129,7 @@ bool fault_injected(enum faults f)
  * Hint: compel on aarch64 shall learn relocs for that.
  */
 static unsigned __page_size;
-unsigned page_size(void)
+unsigned long page_size(void)
 {
 	return __page_size;
 }
@@ -216,20 +227,39 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 	int b, i, ret;
 	struct cap_header hdr;
 	struct cap_data data[_LINUX_CAPABILITY_U32S_3];
-
-	/*
-	 * We're still root here and thus can do it without failures.
-	 */
+	int ruid, euid, suid, fsuid;
+	int rgid, egid, sgid, fsgid;
 
 	/*
 	 * Setup supplementary group IDs early.
 	 */
 	if (args->groups) {
-		ret = sys_setgroups(ce->n_groups, args->groups);
-		if (ret) {
-			pr_warn("Can't setup supplementary group IDs: %d\n", ret);
-			return -1;
+		/*
+		 * We may be in an unprivileged user namespace where setgroups
+		 * is disabled.  If the current list of groups is already what
+		 * we want, skip the call to setgroups.
+		 */
+		unsigned int gids[MAX_GETGROUPS_CHECKED];
+		int n = sys_getgroups(MAX_GETGROUPS_CHECKED, gids);
+		if (n != ce->n_groups || memcmp(gids, args->groups, n * sizeof(*gids))) {
+			ret = sys_setgroups(ce->n_groups, args->groups);
+			if (ret) {
+				pr_warn("Can't setgroups([%zu gids]): %d\n", ce->n_groups, ret);
+				return -1;
+			}
 		}
+	}
+
+	/*
+	 * Compare xids with current values. If all match then we can skip
+	 * setting them (which requires extra capabilities).
+	 */
+	fsuid = sys_setfsuid(-1);
+	fsgid = sys_setfsgid(-1);
+	if (sys_getresuid(&ruid, &euid, &suid) == 0 && sys_getresgid(&rgid, &egid, &sgid) == 0 && ruid == ce->uid &&
+	    euid == ce->euid && suid == ce->suid && rgid == ce->gid && egid == ce->egid && sgid == ce->sgid &&
+	    fsuid == ce->fsuid && fsgid == ce->fsgid) {
+		goto skip_xids;
 	}
 
 	/*
@@ -275,12 +305,13 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 		return -1;
 	}
 
+skip_xids:
 	/*
 	 * Third -- restore securebits. We don't need them in any
 	 * special state any longer.
 	 */
 
-	if (!uid) {
+	if (sys_prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) != ce->secbits) {
 		ret = sys_prctl(PR_SET_SECUREBITS, ce->secbits, 0, 0, 0);
 		if (ret) {
 			pr_err("Unable to set PR_SET_SECUREBITS: %d\n", ret);
@@ -301,10 +332,18 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 				/* already set */
 				continue;
 			ret = sys_prctl(PR_CAPBSET_DROP, i + b * 32, 0, 0, 0);
-			if (ret) {
+			if (!ret)
+				continue;
+			if (!ce->has_no_new_privs || !ce->no_new_privs || args->cap_prm[b] & (1 << i)) {
 				pr_warn("Unable to drop capability %d: %d\n", i + b * 32, ret);
 				return -1;
 			}
+			/*
+			 * If prctl(NO_NEW_PRIVS) is going to be set then it
+			 * will prevent inheriting the capabilities not in
+			 * the permitted set.
+			 */
+			pr_warn("Unable to drop capability %d from bset: %d (but NO_NEW_PRIVS will drop it)\n", i + b * 32, ret);
 		}
 	}
 
@@ -344,6 +383,14 @@ static int restore_creds(struct thread_creds_args *args, int procfd, int lsm_typ
 	/* Also set the sockcreate label for all threads */
 	if (lsm_set_label(args->lsm_sockcreate, "sockcreate", procfd) < 0)
 		return -1;
+
+	if (ce->has_no_new_privs && ce->no_new_privs) {
+		ret = sys_prctl(PR_SET_NO_NEW_PRIVS, ce->no_new_privs, 0, 0, 0);
+		if (ret) {
+			pr_err("Unable to set no_new_privs=%d: %d\n", ce->no_new_privs, ret);
+			return -1;
+		}
+	}
 
 	return 0;
 }
@@ -713,7 +760,7 @@ static int recv_cg_set_restore_ack(int sk)
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
  */
-long __export_restore_thread(struct thread_restore_args *args)
+__visible long __export_restore_thread(struct thread_restore_args *args)
 {
 	struct rt_sigframe *rt_sigframe;
 	k_rtsigset_t to_block;
@@ -1097,7 +1144,7 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 		 * |G|----tgt----|       |
 		 *
 		 * 3. remap src to any other place.
-		 *    G prevents src from being remaped on tgt again
+		 *    G prevents src from being remapped on tgt again
 		 * |       |-------------| -> |+++++src+++++|
 		 * |G|---tgt-----|                          |
 		 *
@@ -1198,7 +1245,7 @@ static int timerfd_arm(struct task_restore_args *args)
 static int create_posix_timers(struct task_restore_args *args)
 {
 	int ret, i;
-	kernel_timer_t next_id;
+	kernel_timer_t next_id = 0, timer_id;
 	struct sigevent sev;
 
 	for (i = 0; i < args->posix_timers_n; i++) {
@@ -1212,24 +1259,25 @@ static int create_posix_timers(struct task_restore_args *args)
 		sev.sigev_value.sival_ptr = args->posix_timers[i].spt.sival_ptr;
 
 		while (1) {
-			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &next_id);
+			ret = sys_timer_create(args->posix_timers[i].spt.clock_id, &sev, &timer_id);
 			if (ret < 0) {
 				pr_err("Can't create posix timer - %d\n", i);
 				return ret;
 			}
 
-			if (next_id == args->posix_timers[i].spt.it_id)
-				break;
-
-			ret = sys_timer_delete(next_id);
-			if (ret < 0) {
-				pr_err("Can't remove temporaty posix timer 0x%x\n", next_id);
-				return ret;
-			}
-
-			if ((long)next_id > args->posix_timers[i].spt.it_id) {
+			if (timer_id != next_id) {
 				pr_err("Can't create timers, kernel don't give them consequently\n");
 				return -1;
+			}
+			next_id++;
+
+			if (timer_id == args->posix_timers[i].spt.it_id)
+				break;
+
+			ret = sys_timer_delete(timer_id);
+			if (ret < 0) {
+				pr_err("Can't remove temporaty posix timer 0x%x\n", timer_id);
+				return ret;
 			}
 		}
 	}
@@ -1257,7 +1305,7 @@ unsigned long vdso_rt_size = 0;
 void *bootstrap_start = NULL;
 unsigned int bootstrap_len = 0;
 
-void __export_unmap(void)
+__visible void __export_unmap(void)
 {
 	sys_munmap(bootstrap_start, bootstrap_len - vdso_rt_size);
 }
@@ -1465,6 +1513,40 @@ static int fd_poll(int inotify_fd)
 }
 
 /*
+ * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
+ */
+static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
+{
+	size_t saved_last_iov_len = 0;
+	ssize_t ret;
+
+	if (max_to_read) {
+		for (int i = 0; i < nr; ++i) {
+			if (iovs[i].iov_len <= max_to_read) {
+				max_to_read -= iovs[i].iov_len;
+				continue;
+			}
+
+			if (!max_to_read) {
+				nr = i;
+				break;
+			}
+
+			saved_last_iov_len = iovs[i].iov_len;
+			iovs[i].iov_len = max_to_read;
+			nr = i + 1;
+			break;
+		}
+	}
+
+	ret = sys_preadv(fd, iovs, nr, offs);
+	if (saved_last_iov_len)
+		iovs[nr - 1].iov_len = saved_last_iov_len;
+
+	return ret;
+}
+
+/*
  * In the worst case buf size should be:
  *   sizeof(struct inotify_event) * 2 + PATH_MAX
  * See round_event_name_len() in kernel.
@@ -1544,13 +1626,37 @@ static ssize_t mmap_image(int fd, const struct iovec *iov, int iovcnt,
 }
 
 /*
+ * Restore membarrier() registrations.
+ */
+static int restore_membarrier_registrations(int mask)
+{
+	unsigned long bitmap[1] = { mask };
+	int i, err, ret = 0;
+
+	if (!mask)
+		return 0;
+
+	pr_info("Restoring membarrier() registrations %x\n", mask);
+
+	for_each_bit(i, bitmap) {
+		err = sys_membarrier(1 << i, 0, 0);
+		if (!err)
+			continue;
+		pr_err("Can't restore membarrier(1 << %d) registration: %d\n", i, err);
+		ret = -1;
+	}
+
+	return ret;
+}
+
+/*
  * The main routine to restore task via sigreturn.
  * This one is very special, we never return there
  * but use sigreturn facility to restore core registers
  * and jump execution to some predefined ip read from
  * core file.
  */
-long __export_restore_task(struct task_restore_args *args)
+__visible long __export_restore_task(struct task_restore_args *args)
 {
 	long ret = -1;
 	int i;
@@ -1682,17 +1788,13 @@ long __export_restore_task(struct task_restore_args *args)
 			goto core_restore_end;
 	}
 
-	if (args->uffd > -1) {
-		/* re-enable THP if we disabled it previously */
-		if (args->has_thp_enabled) {
-			int ret;
-			ret = sys_prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
-			if (ret) {
-				pr_err("Cannot re-enable THP: %d\n", ret);
-				goto core_restore_end;
-			}
-		}
+	ret = sys_prctl(PR_SET_THP_DISABLE, args->thp_disabled, 0, 0, 0);
+	if (ret) {
+		pr_err("Cannot restore THP_DISABLE=%d flag: %ld\n", args->thp_disabled, ret);
+		goto core_restore_end;
+	}
 
+	if (args->uffd > -1) {
 		pr_debug("lazy-pages: closing uffd %d\n", args->uffd);
 		/*
 		 * All userfaultfd configuration has finished at this point.
@@ -1735,9 +1837,15 @@ long __export_restore_task(struct task_restore_args *args)
 		while (nr) {
 			pr_debug("Preadv %lx:%d... (%d iovs) (mmap %d)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr, args->mmap_page_image);
 			if (!args->mmap_page_image)
-				r = sys_preadv(args->vma_ios_fd, iovs, nr, rio->off);
+                        	/*
+                       	 	 * If we're requested to punch holes in the file after reading we do
+                         	 * it to save memory. Limit the reads then to an arbitrary block size.
+                         	 */ 
+				r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
+					  	   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
 			else
 				r = mmap_image(args->vma_ios_fd, iovs, nr, rio->off);
+
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
 				goto core_restore_end;
@@ -2079,6 +2187,9 @@ long __export_restore_task(struct task_restore_args *args)
 		pr_err("Can't restore timerfd %ld\n", ret);
 		goto core_restore_end;
 	}
+
+	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
+		goto core_restore_end;
 
 	pr_info("%ld: Restored\n", sys_getpid());
 

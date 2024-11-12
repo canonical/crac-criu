@@ -50,6 +50,7 @@ enum criu_cg_mode {
 enum criu_network_lock_method {
 	CRIU_NETWORK_LOCK_IPTABLES = 1,
 	CRIU_NETWORK_LOCK_NFTABLES = 2,
+	CRIU_NETWORK_LOCK_SKIP = 3,
 };
 
 enum criu_pre_dump_mode { CRIU_PRE_DUMP_SPLICE = 1, CRIU_PRE_DUMP_READ = 2 };
@@ -321,6 +322,9 @@ struct criu_feature_check {
 
 int criu_feature_check(struct criu_feature_check *features, size_t size);
 int criu_local_feature_check(criu_opts *opts, struct criu_feature_check *features, size_t size);
+
+void criu_local_set_empty_ns(criu_opts *opts, int namespaces);
+void criu_set_empty_ns(int namespaces);
 
 #ifdef __GNUG__
 }

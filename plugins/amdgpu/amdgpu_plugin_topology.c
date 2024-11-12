@@ -1063,7 +1063,7 @@ static bool iolink_match(struct tp_iolink *src, struct tp_iolink *dest)
  *
  * Nodes compatibility are determined by:
  * 1. Comparing the node properties
- * 2. Making sure iolink mappings to CPUs would be compabitle with existing iolink mappings in maps
+ * 2. Making sure iolink mappings to CPUs would be compatible with existing iolink mappings in maps
  *
  * If src_node and dest_node are mappable, then map_device will push the new mapping
  * for src_node -> dest_node into new_maps.
@@ -1241,7 +1241,7 @@ static bool map_devices(struct tp_system *src_sys, struct tp_system *dest_sys, s
 				return true;
 			} else {
 				/* We could not map remaining nodes in the list. Add dest node back
-				 * to list and try to map next dest ndoe in list to current src
+				 * to list and try to map next dest node in list to current src
 				 * node.
 				 */
 				pr_debug("Nodes after [0x%04X -> 0x%04X] did not match, "

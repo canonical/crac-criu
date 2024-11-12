@@ -19,7 +19,7 @@ endif
 
 #
 # Supported Architectures
-ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips,$(ARCH)),)
+ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips loongarch64,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")
 endif
 
@@ -35,18 +35,18 @@ ifeq ($(ARCH),arm)
         ARMV		:= $(shell echo $(SUBARCH) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
 
         ifeq ($(ARMV),6)
-                USERCFLAGS += -march=armv6
+                ARCHCFLAGS += -march=armv6
         endif
 
         ifeq ($(ARMV),7)
-                USERCFLAGS += -march=armv7-a+fp
+                ARCHCFLAGS += -march=armv7-a+fp
         endif
 
         ifeq ($(ARMV),8)
                 # Running 'setarch linux32 uname -m' returns armv8l on travis aarch64.
                 # This tells CRIU to handle armv8l just as armv7hf. Right now this is
                 # only used for compile testing. No further verification of armv8l exists.
-                USERCFLAGS += -march=armv7-a
+                ARCHCFLAGS += -march=armv7-a
                 ARMV := 7
         endif
 
@@ -78,6 +78,10 @@ endif
 
 ifeq ($(ARCH),mips)
         DEFINES		:= -DCONFIG_MIPS
+endif
+
+ifeq ($(ARCH),loongarch64)
+        DEFINES		:= -DCONFIG_LOONGARCH64
 endif
 
 #
@@ -122,6 +126,10 @@ ifeq ($(ARCH),mips)
 WARNINGS		:= -rdynamic
 endif
 
+ifeq ($(ARCH),loongarch64)
+WARNINGS		:= -Wno-implicit-function-declaration
+endif
+
 ifneq ($(GCOV),)
         LDFLAGS         += -lgcov
         CFLAGS          += $(CFLAGS-GCOV)
@@ -151,7 +159,7 @@ export GMON GMONLDOPT
 endif
 
 AFLAGS			+= -D__ASSEMBLY__
-CFLAGS			+= $(USERCFLAGS) $(WARNINGS) $(DEFINES) -iquote include/
+CFLAGS			+= $(USERCFLAGS) $(ARCHCFLAGS) $(WARNINGS) $(DEFINES) -iquote include/
 HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
@@ -272,26 +280,19 @@ criu: $(criu-deps)
 	$(Q) $(MAKE) $(build)=criu all
 .PHONY: criu
 
-crit/Makefile: ;
-crit/%: criu .FORCE
-	$(Q) $(MAKE) $(build)=crit $@
-crit: criu
-	$(Q) $(MAKE) $(build)=crit all
-.PHONY: crit
-
 unittest: $(criu-deps)
 	$(Q) $(MAKE) $(build)=criu unittest
 .PHONY: unittest
 
 
 #
-# Libraries next once crit it ready
+# Libraries next once criu is ready
 # (we might generate headers and such
 # when building criu itself).
 lib/Makefile: ;
-lib/%: crit .FORCE
+lib/%: criu .FORCE
 	$(Q) $(MAKE) $(build)=lib $@
-lib: crit
+lib: criu
 	$(Q) $(MAKE) $(build)=lib all
 .PHONY: lib
 
@@ -300,10 +301,9 @@ clean mrproper:
 	$(Q) $(MAKE) $(build)=criu $@
 	$(Q) $(MAKE) $(build)=soccr $@
 	$(Q) $(MAKE) $(build)=lib $@
+	$(Q) $(MAKE) $(build)=crit $@
 	$(Q) $(MAKE) $(build)=compel $@
 	$(Q) $(MAKE) $(build)=compel/plugins $@
-	$(Q) $(MAKE) $(build)=lib $@
-	$(Q) $(MAKE) $(build)=crit $@
 	$(Q) $(MAKE) -C lz4 clean
 	rm -rf $(LZ4_OBJS)
 .PHONY: clean mrproper
@@ -351,6 +351,10 @@ test: zdtm
 amdgpu_plugin: criu
 	$(Q) $(MAKE) -C plugins/amdgpu all
 .PHONY: amdgpu_plugin
+
+crit: lib
+	$(Q) $(MAKE) -C crit
+.PHONY: crit
 
 #
 # Generating tar requires tag matched CRIU_VERSION.
@@ -417,6 +421,7 @@ help:
 	@echo '    Targets:'
 	@echo '      all             - Build all [*] targets'
 	@echo '    * criu            - Build criu'
+	@echo '    * crit            - Build crit'
 	@echo '      zdtm            - Build zdtm test-suite'
 	@echo '      docs            - Build documentation'
 	@echo '      install         - Install CRIU (see INSTALL.md)'
@@ -440,12 +445,15 @@ lint:
 	flake8 --config=scripts/flake8.cfg test/zdtm.py
 	flake8 --config=scripts/flake8.cfg test/inhfd/*.py
 	flake8 --config=scripts/flake8.cfg test/others/rpc/config_file.py
-	flake8 --config=scripts/flake8.cfg lib/py/images/pb2dict.py
-	flake8 --config=scripts/flake8.cfg lib/py/images/images.py
+	flake8 --config=scripts/flake8.cfg lib/pycriu/images/pb2dict.py
+	flake8 --config=scripts/flake8.cfg lib/pycriu/images/images.py
 	flake8 --config=scripts/flake8.cfg scripts/criu-ns
-	flake8 --config=scripts/flake8.cfg crit/setup.py
+	flake8 --config=scripts/flake8.cfg test/others/criu-ns/run.py
+	flake8 --config=scripts/flake8.cfg crit/*.py
+	flake8 --config=scripts/flake8.cfg crit/crit/*.py
 	flake8 --config=scripts/flake8.cfg scripts/uninstall_module.py
-	flake8 --config=scripts/flake8.cfg coredump/
+	flake8 --config=scripts/flake8.cfg coredump/ coredump/coredump
+	flake8 --config=scripts/flake8.cfg scripts/github-indent-warnings.py
 	shellcheck --version
 	shellcheck scripts/*.sh
 	shellcheck scripts/ci/*.sh scripts/ci/apt-install
@@ -453,13 +461,14 @@ lint:
 	shellcheck -x test/others/libcriu/*.sh
 	shellcheck -x test/others/crit/*.sh test/others/criu-coredump/*.sh
 	shellcheck -x test/others/config-file/*.sh
+	shellcheck -x test/others/action-script/*.sh
 	codespell -S tags
-	# Do not append \n to pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*\\n"'
-	# Do not use %m with pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_(err|perror|warn|debug|info|msg)|fail)\>.*%m'
-	# Do not use errno with pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>\(".*".*errno'
+	# Do not append \n to pr_perror, pr_pwarn or fail
+	! git --no-pager grep -E '^\s*\<(pr_perror|pr_pwarn|fail)\>.*\\n"'
+	# Do not use %m with pr_* or fail
+	! git --no-pager grep -E '^\s*\<(pr_(err|perror|warn|pwarn|debug|info|msg)|fail)\>.*%m'
+	# Do not use errno with pr_perror, pr_pwarn or fail
+	! git --no-pager grep -E '^\s*\<(pr_perror|pr_pwarn|fail)\>\(".*".*errno'
 	# End pr_(err|warn|msg|info|debug) with \n
 	! git --no-pager grep -En '^\s*\<pr_(err|warn|msg|info|debug)\>.*);$$' | grep -v '\\n'
 	# No EOL whitespace for C files

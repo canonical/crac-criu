@@ -407,46 +407,24 @@ static int mklnk_ghost(char *path, GhostFileEntry *gfe)
 static int ghost_apply_metadata(const char *path, GhostFileEntry *gfe)
 {
 	struct timeval tv[2];
-	int ret = -1;
 
-	if (S_ISLNK(gfe->mode)) {
-		if (lchown(path, gfe->uid, gfe->gid) < 0) {
-			pr_perror("Can't reset user/group on ghost %s", path);
-			goto err;
-		}
+	if (cr_fchpermat(AT_FDCWD, path, gfe->uid, gfe->gid, gfe->mode, AT_SYMLINK_NOFOLLOW) < 0)
+		return -1;
 
-		/*
-		 * We have no lchmod() function, and fchmod() will fail on
-		 * O_PATH | O_NOFOLLOW fd. Yes, we have fchmodat()
-		 * function and flag AT_SYMLINK_NOFOLLOW described in
-		 * man 2 fchmodat, but it is not currently implemented. %)
-		 */
-	} else {
-		if (chown(path, gfe->uid, gfe->gid) < 0) {
-			pr_perror("Can't reset user/group on ghost %s", path);
-			goto err;
-		}
+	if (!gfe->atim)
+		return 0;
 
-		if (chmod(path, gfe->mode)) {
-			pr_perror("Can't set perms %o on ghost %s", gfe->mode, path);
-			goto err;
-		}
+	tv[0].tv_sec = gfe->atim->tv_sec;
+	tv[0].tv_usec = gfe->atim->tv_usec;
+	tv[1].tv_sec = gfe->mtim->tv_sec;
+	tv[1].tv_usec = gfe->mtim->tv_usec;
+
+	if (lutimes(path, tv)) {
+		pr_perror("Can't set access and modification times on ghost %s", path);
+		return -1;
 	}
 
-	if (gfe->atim) {
-		tv[0].tv_sec = gfe->atim->tv_sec;
-		tv[0].tv_usec = gfe->atim->tv_usec;
-		tv[1].tv_sec = gfe->mtim->tv_sec;
-		tv[1].tv_usec = gfe->mtim->tv_usec;
-		if (lutimes(path, tv)) {
-			pr_perror("Can't set access and modification times on ghost %s", path);
-			goto err;
-		}
-	}
-
-	ret = 0;
-err:
-	return ret;
+	return 0;
 }
 
 static int create_ghost_dentry(char *path, GhostFileEntry *gfe, struct cr_img *img)
@@ -1672,21 +1650,9 @@ static int get_build_id_64(Elf64_Ehdr *file_header, unsigned char **build_id, co
  */
 static int get_build_id(const int fd, const struct stat *fd_status, unsigned char **build_id)
 {
-	char buf[SELFMAG + 1];
-	void *start_addr;
+	char *start_addr;
 	size_t mapped_size;
 	int ret = -1;
-
-	if (read(fd, buf, SELFMAG + 1) != SELFMAG + 1)
-		return -1;
-
-	/*
-	 * The first 4 bytes contain a magic number identifying the file as an
-	 * ELF file. They should contain the characters ‘\x7f’, ‘E’, ‘L’, and
-	 * ‘F’, respectively. These characters are together defined as ELFMAG.
-	 */
-	if (strncmp(buf, ELFMAG, SELFMAG))
-		return -1;
 
 	/*
 	 * If the build-id exists, then it will most likely be present in the
@@ -1695,16 +1661,25 @@ static int get_build_id(const int fd, const struct stat *fd_status, unsigned cha
 	 */
 	mapped_size = min_t(size_t, fd_status->st_size, BUILD_ID_MAP_SIZE);
 	start_addr = mmap(0, mapped_size, PROT_READ, MAP_PRIVATE | MAP_FILE, fd, 0);
-	if (start_addr == MAP_FAILED) {
+	if ((void*)start_addr == MAP_FAILED) {
 		pr_warn("Couldn't mmap file with fd %d\n", fd);
 		return -1;
 	}
 
-	if (buf[EI_CLASS] == ELFCLASS32)
-		ret = get_build_id_32(start_addr, build_id, fd, mapped_size);
-	if (buf[EI_CLASS] == ELFCLASS64)
-		ret = get_build_id_64(start_addr, build_id, fd, mapped_size);
+	/*
+	 * The first 4 bytes contain a magic number identifying the file as an
+	 * ELF file. They should contain the characters ‘\x7f’, ‘E’, ‘L’, and
+	 * ‘F’, respectively. These characters are together defined as ELFMAG.
+	 */
+	if (memcmp(start_addr, ELFMAG, SELFMAG))
+		goto out;
 
+	if (start_addr[EI_CLASS] == ELFCLASS32)
+		ret = get_build_id_32((Elf32_Ehdr *)start_addr, build_id, fd, mapped_size);
+	if (start_addr[EI_CLASS] == ELFCLASS64)
+		ret = get_build_id_64((Elf64_Ehdr *)start_addr, build_id, fd, mapped_size);
+
+out:
 	munmap(start_addr, mapped_size);
 	return ret;
 }
@@ -1826,7 +1801,8 @@ int dump_one_reg_file(int lfd, u32 id, const struct fd_parms *p)
 	}
 
 	if (!skip_for_shell_job && mnt_is_overmounted(mi)) {
-		pr_err("Open files on overmounted mounts are not supported yet\n");
+		pr_err("Open files on overmounted mounts are not supported yet; mount=%d fd=%d path=%s\n",
+		       p->mnt_id, p->fd, link->name + 1);
 		return -1;
 	}
 
@@ -2535,9 +2511,10 @@ static int open_filemap(int pid, struct vma_area *vma)
 			 * using dup because dup returns a reference to the same struct file inside kernel, but we
 			 * cannot open a new FD.
 			 */
-			ret = dup(plugin_fd);
+			ret = plugin_fd;
 		} else if (vma->e->status & VMA_AREA_MEMFD) {
-			ret = memfd_open(vma->vmfd, &flags);
+			if (!inherited_fd(vma->vmfd, &ret))
+				ret = memfd_open(vma->vmfd, &flags, true);
 		} else {
 			ret = open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
 		}

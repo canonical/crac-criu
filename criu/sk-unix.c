@@ -878,7 +878,8 @@ static int __dump_external_socket(struct unix_sk_desc *sk, struct unix_sk_desc *
 
 	if (peer->type != SOCK_DGRAM) {
 		show_one_unix("Ext stream not supported", peer);
-		pr_err("Can't dump half of stream unix connection.\n");
+		pr_err("Can't dump half of stream unix connection. name: %s; peer name: %s\n",
+		       sk->name, peer->name);
 		return -1;
 	}
 
@@ -1430,32 +1431,22 @@ err_revert_and_exit:
 
 static int restore_file_perms(struct unix_sk_info *ui)
 {
-	if (ui->ue->file_perms) {
-		FilePermsEntry *perms = ui->ue->file_perms;
-		char fname[PATH_MAX];
+	FilePermsEntry *perms = ui->ue->file_perms;
+	char fname[PATH_MAX];
 
-		if (ui->ue->name.len >= sizeof(fname)) {
-			pr_err("The file name is too long\n");
-			return -E2BIG;
-		}
+	if (!perms)
+		return 0;
 
-		memcpy(fname, ui->name, ui->ue->name.len);
-		fname[ui->ue->name.len] = '\0';
-
-		if (fchownat(AT_FDCWD, fname, perms->uid, perms->gid, 0) < 0) {
-			int errno_cpy = errno;
-			pr_perror("Unable to change file owner and group");
-			return -errno_cpy;
-		}
-
-		if (fchmodat(AT_FDCWD, fname, perms->mode, 0) < 0) {
-			int errno_cpy = errno;
-			pr_perror("Unable to change file mode bits");
-			return -errno_cpy;
-		}
+	if (ui->ue->name.len >= sizeof(fname)) {
+		pr_err("The file name is too long\n");
+		errno = -E2BIG;
+		return -1;
 	}
 
-	return 0;
+	memcpy(fname, ui->name, ui->ue->name.len);
+	fname[ui->ue->name.len] = '\0';
+
+	return cr_fchpermat(AT_FDCWD, fname, perms->uid, perms->gid, perms->mode, 0);
 }
 
 static int keep_deleted(struct unix_sk_info *ui)

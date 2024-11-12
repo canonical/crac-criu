@@ -161,7 +161,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * put the memory into the page-pipe's pipe.
  *
  * "Holes" in page-pipe are regions, that should be dumped, but
- * the memory contents is present in the pagent image set.
+ * the memory contents is present in the parent image set.
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
@@ -1217,8 +1217,6 @@ err_addr:
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 {
-	MmEntry *mm = rsti(t)->mm;
-
 	/*
 	 * There is no need to disable it if the page read doesn't
 	 * have parent. In this case VMA will be empty until
@@ -1241,8 +1239,6 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 		pr_perror("Cannot disable THP");
 		return -1;
 	}
-	if (!(mm->has_thp_disabled && mm->thp_disabled))
-		rsti(t)->has_thp_enabled = true;
 
 	return 0;
 }

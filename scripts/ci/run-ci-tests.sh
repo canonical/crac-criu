@@ -5,8 +5,8 @@ CI_PKGS=(protobuf-c-compiler libprotobuf-c-dev libaio-dev libgnutls28-dev
 		libgnutls30 libprotobuf-dev protobuf-compiler libcap-dev
 		libnl-3-dev gdb bash libnet-dev util-linux asciidoctor
 		libnl-route-3-dev time flake8 libbsd-dev python3-yaml
-		libperl-dev pkg-config python3-future python3-protobuf
-		python3-pip python3-importlib-metadata python3-junit.xml)
+		libperl-dev pkg-config python3-protobuf python3-pip
+		python3-importlib-metadata python3-junit.xml libdrm-dev)
 
 X86_64_PKGS=(gcc-multilib)
 
@@ -58,10 +58,6 @@ ci_prep () {
 
 	scripts/ci/apt-install "${CI_PKGS[@]}"
 	chmod a+x "$HOME"
-
-	# zdtm uses an unversioned python binary to run the tests.
-	# let's point python to python3
-	ln -sf /usr/bin/python3 /usr/bin/python
 }
 
 test_stream() {
@@ -260,6 +256,7 @@ if [ -n "$TRAVIS" ] || [ -n "$CIRCLECI" ]; then
        # Error (criu/tty.c:1014): tty: Don't have tty to inherit session from, aborting
        make -C test/others/shell-job/ run
 fi
+make -C test/others/criu-ns/ run
 make -C test/others/skip-file-rwx-check/ run
 make -C test/others/rpc/ run
 
@@ -319,6 +316,9 @@ make -C test/others/ns_ext run
 # config file parser and parameter testing
 make -C test/others/config-file run
 
+# action script testing
+make -C test/others/action-script run
+
 # Skip all further tests when running with GCOV=1
 # The one test which currently cannot handle GCOV testing is compel/test
 # Probably because the GCOV Makefile infrastructure does not exist in compel
@@ -326,3 +326,8 @@ make -C test/others/config-file run
 
 # compel testing
 make -C compel/test
+
+# amdgpu_plugin testing
+make amdgpu_plugin
+make -C plugins/amdgpu/ test_topology_remap
+./plugins/amdgpu/test_topology_remap

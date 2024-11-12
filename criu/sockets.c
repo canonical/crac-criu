@@ -38,7 +38,7 @@
 #define SOCK_DIAG_BY_FAMILY 20
 #endif
 
-#define SK_HASH_SIZE 32
+#define SK_HASH_SIZE (1 << 14)
 
 #ifndef SO_GET_FILTER
 #define SO_GET_FILTER SO_ATTACH_FILTER
@@ -469,7 +469,7 @@ int do_restore_opt(int sk, int level, int name, void *val, int len)
 int sk_setbufs(int sk, uint32_t *bufs)
 {
 	uint32_t sndbuf = bufs[0], rcvbuf = bufs[1];
-
+        pr_perror("sk_setbufs");
 	if (setsockopt(sk, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf)) ||
 	    setsockopt(sk, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf))) {
 		if (opts.unprivileged) {

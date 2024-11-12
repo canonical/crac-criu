@@ -639,8 +639,8 @@ static int open_cgroupfs(struct cg_ctl *cc)
 		return -1;
 	}
 
-	if (mount("none", prefix, fstype, 0, mopts) < 0) {
-		pr_perror("Unable to mount %s", mopts);
+	if (mount("none", prefix, fstype, 0, mopts[0] ? mopts : NULL) < 0) {
+		pr_perror("Unable to mount %s %s", fstype, mopts);
 		rmdir(prefix);
 		return -1;
 	}
@@ -714,6 +714,8 @@ static int collect_cgroups(struct list_head *ctls)
 			}
 		} else {
 			fd = open_cgroupfs(cc);
+			if (fd < 0)
+				return -1;
 		}
 
 		path_pref_len = snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
@@ -1202,16 +1204,11 @@ static int prepare_cgns(CgSetEntry *se)
 	return 0;
 }
 
-static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
+static int move_in_cgroup(CgSetEntry *se)
 {
 	int i;
 
 	pr_info("Move into %d\n", se->id);
-
-	if (setup_cgns && prepare_cgns(se) < 0) {
-		pr_err("failed preparing cgns\n");
-		return -1;
-	}
 
 	for (i = 0; i < se->n_ctls; i++) {
 		char aux[PATH_MAX];
@@ -1252,7 +1249,44 @@ static int move_in_cgroup(CgSetEntry *se, bool setup_cgns)
 	return 0;
 }
 
-int prepare_task_cgroup(struct pstree_item *me)
+int prepare_cgroup_namespace(struct pstree_item *root_task)
+{
+	CgSetEntry *se;
+
+	if (opts.manage_cgroups == CG_MODE_IGNORE)
+		return 0;
+
+	if (root_task->parent) {
+		pr_err("Expecting root_task to restore cgroup namespace\n");
+		return -1;
+	}
+
+	/*
+	 * If on dump all dumped tasks are in same cgset with criu we don't
+	 * dump cgsets and thus cgroup namespaces and rely that on restore
+	 * criu caller would prepare proper cgset/cgns for us. Also in case
+	 * of --unprivileged we don't even have the root cgset here.
+	 */
+	if (!rsti(root_task)->cg_set || rsti(root_task)->cg_set == root_cg_set) {
+		pr_info("Cgroup namespace inherited from parent\n");
+		return 0;
+	}
+
+	se = find_rst_set_by_id(rsti(root_task)->cg_set);
+	if (!se) {
+		pr_err("No set %d found\n", rsti(root_task)->cg_set);
+		return -1;
+	}
+
+	if (prepare_cgns(se) < 0) {
+		pr_err("failed preparing cgns\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+int restore_task_cgroup(struct pstree_item *me)
 {
 	struct pstree_item *parent = me->parent;
 	CgSetEntry *se;
@@ -1284,13 +1318,7 @@ int prepare_task_cgroup(struct pstree_item *me)
 		return -1;
 	}
 
-	/* Since don't support nesting of cgroup namespaces, let's only set up
-	 * the cgns (if it exists) in the init task. In the future, we should
-	 * just check that the cgns prefix string matches for all the entries
-	 * in the cgset, and only unshare if that's true.
-	 */
-
-	return move_in_cgroup(se, !me->parent);
+	return move_in_cgroup(se);
 }
 
 void fini_cgroup(void)
@@ -1307,34 +1335,6 @@ void fini_cgroup(void)
 	}
 	xfree(cg_yard);
 	cg_yard = NULL;
-}
-
-static int restore_perms(int fd, const char *path, CgroupPerms *perms)
-{
-	struct stat sb;
-
-	if (perms) {
-		if (fstat(fd, &sb) < 0) {
-			pr_perror("stat of property %s failed", path);
-			return -1;
-		}
-
-		/* only chmod/chown if the perms are actually different: we aren't
-		 * allowed to chmod some cgroup props (e.g. the read only ones), so we
-		 * don't want to try if the perms already match.
-		 */
-		if (sb.st_mode != (mode_t)perms->mode && fchmod(fd, perms->mode) < 0) {
-			pr_perror("chmod of %s failed", path);
-			return -1;
-		}
-
-		if ((sb.st_uid != perms->uid || sb.st_gid != perms->gid) && fchown(fd, perms->uid, perms->gid)) {
-			pr_perror("chown of %s failed", path);
-			return -1;
-		}
-	}
-
-	return 0;
 }
 
 static int add_subtree_control_prop_prefix(char *input, char *output, char prefix)
@@ -1434,7 +1434,7 @@ static int restore_cgroup_prop(const CgroupPropEntry *cg_prop_entry_p, char *pat
 		return -1;
 	}
 
-	if (restore_perms(fd, path, perms) < 0)
+	if (perms && cr_fchperm(fd, perms->uid, perms->gid, perms->mode) < 0)
 		goto out;
 
 	/* skip these two since restoring their values doesn't make sense */
@@ -1758,7 +1758,7 @@ static int restore_special_props(char *paux, size_t off, CgroupDirEntry *e)
 
 static int prepare_dir_perms(int cg, char *path, CgroupPerms *perms)
 {
-	int fd, ret;
+	int fd, ret = 0;
 
 	fd = openat(cg, path, O_DIRECTORY);
 	if (fd < 0) {
@@ -1766,7 +1766,8 @@ static int prepare_dir_perms(int cg, char *path, CgroupPerms *perms)
 		return -1;
 	}
 
-	ret = restore_perms(fd, path, perms);
+	if (perms)
+		ret = cr_fchperm(fd, perms->uid, perms->gid, perms->mode);
 	close(fd);
 	return ret;
 }

@@ -1,6 +1,6 @@
 LIBDIR	:= .
 
-CFLAGS	+= $(USERCFLAGS)
+CFLAGS	+= $(USERCFLAGS) $(ARCHCFLAGS)
 
 LIB	:= libzdtmtst.a
 
@@ -34,4 +34,4 @@ clean: clean-more
 
 $(LIB):	$(LIBOBJ)
 	$(E) " AR       " $@
-	$(Q)ar rcs $@ $^
+	$(Q)$(AR) rcs $@ $^

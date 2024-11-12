@@ -39,6 +39,8 @@ static int lock_connection(struct inet_sk_desc *sk)
 		return iptables_lock_connection(sk);
 	else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
 		return nftables_lock_connection(sk);
+	else if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
 
 	return -1;
 }
@@ -49,6 +51,8 @@ static int unlock_connection(struct inet_sk_desc *sk)
 		return iptables_unlock_connection(sk);
 	else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
 		/* All connections will be unlocked in network_unlock(void) */
+		return 0;
+	else if (opts.network_lock_method == NETWORK_LOCK_SKIP)
 		return 0;
 
 	return -1;
@@ -324,7 +328,7 @@ static int restore_tcp_conn_state(int sk, struct libsoccr_sk *socr, struct inet_
 	union libsoccr_addr sa_src, sa_dst;
 
 	pr_info("Restoring TCP connection id %x ino %x\n", ii->ie->id, ii->ie->ino);
-
+        pr_perror("restore_tcp_conn_state");
 	img = open_image(CR_FD_TCP_STREAM, O_RSTR, ii->ie->ino);
 	if (!img)
 		goto err;
@@ -482,6 +486,8 @@ static int unlock_connection_info(struct inet_sk_info *si)
 		return iptables_unlock_connection_info(si);
 	else if (opts.network_lock_method == NETWORK_LOCK_NFTABLES)
 		/* All connections will be unlocked in network_unlock(void) */
+		return 0;
+	else if (opts.network_lock_method == NETWORK_LOCK_SKIP)
 		return 0;
 
 	return -1;

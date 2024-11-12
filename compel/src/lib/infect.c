@@ -591,7 +591,7 @@ static int parasite_trap(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t
 	}
 
 	if (!WIFSTOPPED(status)) {
-		pr_err("Task is still running (pid: %d)\n", pid);
+		pr_err("Task is still running (pid: %d, status: 0x%x)\n", pid, status);
 		goto err;
 	}
 
@@ -1400,7 +1400,7 @@ static int parasite_fini_seized(struct parasite_ctl *ctl)
 
 	pr_debug("Daemon %d exited trapping\n", pid);
 	if (!WIFSTOPPED(status)) {
-		pr_err("Task is still running (pid: %d)\n", pid);
+		pr_err("Task is still running (pid: %d, status: 0x%x)\n", pid, status);
 		return -1;
 	}
 
@@ -1579,7 +1579,7 @@ int compel_stop_pie(pid_t pid, void *addr, bool no_bp)
 	int ret;
 
 	if (no_bp) {
-		pr_debug("Force no-breakpoints restore\n");
+		pr_debug("Force no-breakpoints restore of %d\n", pid);
 		ret = 0;
 	} else
 		ret = ptrace_set_breakpoint(pid, addr);

@@ -1868,7 +1868,7 @@ void criu_set_pidfd_store_sk(int sk)
 int criu_local_set_network_lock(criu_opts *opts, enum criu_network_lock_method method)
 {
 	opts->rpc->has_network_lock = true;
-	if (method == CRIU_NETWORK_LOCK_IPTABLES || method == CRIU_NETWORK_LOCK_NFTABLES) {
+	if (method == CRIU_NETWORK_LOCK_IPTABLES || method == CRIU_NETWORK_LOCK_NFTABLES || method == CRIU_NETWORK_LOCK_SKIP) {
 		opts->rpc->network_lock = (CriuNetworkLockMethod)method;
 		return 0;
 	}
@@ -2029,4 +2029,15 @@ exit:
 int criu_feature_check(struct criu_feature_check *features, size_t size)
 {
 	return criu_local_feature_check(global_opts, features, size);
+}
+
+void criu_local_set_empty_ns(criu_opts *opts, int namespaces)
+{
+	opts->rpc->has_empty_ns = true;
+	opts->rpc->empty_ns = namespaces;
+}
+
+void criu_set_empty_ns(int namespaces)
+{
+	criu_local_set_empty_ns(global_opts, namespaces);
 }

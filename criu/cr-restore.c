@@ -868,6 +868,9 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
 	if (tc->has_child_subreaper)
 		args->child_subreaper = tc->child_subreaper;
 
+	if (tc->has_membarrier_registration_mask)
+		args->membarrier_registration_mask = tc->membarrier_registration_mask;
+
 	/* loginuid value is critical to restore */
 	if (kdat.luid == LUID_FULL && tc->has_loginuid && tc->loginuid != INVALID_UID) {
 		ret = prepare_loginuid(tc->loginuid);
@@ -1886,6 +1889,13 @@ static int restore_task_with_children(void *_arg)
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
 			goto err;
+
+		/*
+		 * Since we don't support nesting of cgroup namespaces, let's
+		 * only set up the cgns (if it exists) in the init task.
+		 */
+		if (prepare_cgroup_namespace(current) < 0)
+			goto err;
 	}
 
 	if (needs_prep_creds(current) && (prepare_userns_creds()))
@@ -1897,7 +1907,7 @@ static int restore_task_with_children(void *_arg)
 	 * we will only move the root one there, others will
 	 * just have it inherited.
 	 */
-	if (prepare_task_cgroup(current) < 0)
+	if (restore_task_cgroup(current) < 0)
 		goto err;
 
 	/* Restore root task */
@@ -2285,7 +2295,7 @@ static void reap_zombies(void)
 
 static int restore_root_task(struct pstree_item *init)
 {
-	enum trace_flags flag = TRACE_ALL;
+	//enum trace_flags flag = TRACE_ALL;
 	int root_seized = 0;
 	bool ptrace_allowed = opts.ptrace_allowed;
 
@@ -2509,7 +2519,7 @@ skip_ns_bouncing:
 
 	timing_stop(TIME_RESTORE);
 	if (ptrace_allowed && catch_tasks(root_seized)) {
-		pr_err("Can't catch all tasks, disabling ptrace\n");
+		pr_warn("Can't catch all tasks, disabling ptrace\n");
 		ptrace_allowed = false;
 		goto out_kill_network_unlocked;
 	}
@@ -2525,9 +2535,6 @@ skip_ns_bouncing:
 			pr_err("Can't stop all tasks on rt_sigreturn\n");
 			goto out_kill_network_unlocked;
 		}
-
-		if (clear_breakpoints())
-			pr_err("Unable to flush breakpoints\n");
 
 		finalize_restore();
 	}
@@ -3014,12 +3021,6 @@ out:
 	return ret;
 }
 
-static inline int verify_cap_size(CredsEntry *ce)
-{
-	return ((ce->n_cap_inh == CR_CAP_SIZE) && (ce->n_cap_eff == CR_CAP_SIZE) && (ce->n_cap_prm == CR_CAP_SIZE) &&
-		(ce->n_cap_bnd == CR_CAP_SIZE));
-}
-
 static int prepare_mm(pid_t pid, struct task_restore_args *args)
 {
 	int exe_fd, i, ret = -1;
@@ -3045,7 +3046,7 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 
 	args->fd_exe_link = exe_fd;
 
-	args->has_thp_enabled = rsti(current)->has_thp_enabled;
+	args->thp_disabled = mm->has_thp_disabled && mm->thp_disabled;
 
 	ret = 0;
 out:
@@ -3170,6 +3171,7 @@ static int prep_rseq(struct rst_rseq_param *rseq, ThreadCoreEntry *tc)
 	return 0;
 }
 
+#if defined(__GLIBC__) && defined(RSEQ_SIG)
 static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
 {
 	if (!kdat.has_rseq) {
@@ -3178,13 +3180,9 @@ static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
 	}
 
         if (!kdat.has_ptrace_get_rseq_conf) {
-#if defined(__GLIBC__) && defined(RSEQ_SIG)
                 rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
                 rseq->rseq_abi_size = __rseq_size;
                 rseq->signature = RSEQ_SIG;
-#else
-                rseq->rseq_abi_pointer = 0;
-#endif
                 return;
         }
 
@@ -3501,16 +3499,30 @@ static bool groups_match(gid_t *groups, int n_groups)
 	return ret;
 }
 
+static void copy_caps(u32 *out_caps, u32 *in_caps, int n_words)
+{
+	int i, cap_end;
+
+	for (i = kdat.last_cap + 1; i < 32 * n_words; ++i) {
+		if (~in_caps[i / 32] & (1 << (i % 32)))
+			continue;
+
+		pr_warn("Dropping unsupported capability %d > %d)\n", i, kdat.last_cap);
+		/* extra caps will be cleared below */
+	}
+
+	n_words = min(n_words, (kdat.last_cap + 31) / 32);
+	cap_end = (kdat.last_cap & 31) + 1;
+	memcpy(out_caps, in_caps, sizeof(*out_caps) * n_words);
+	if ((cap_end & 31) && n_words)
+		out_caps[n_words - 1] &= (1 << cap_end) - 1;
+	memset(out_caps + n_words, 0, sizeof(*out_caps) * (CR_CAP_SIZE - n_words));
+}
+
 static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned long *prev_pos)
 {
 	unsigned long this_pos;
 	struct thread_creds_args *args;
-
-	if (!verify_cap_size(ce)) {
-		pr_err("Caps size mismatch %d %d %d %d\n", (int)ce->n_cap_inh, (int)ce->n_cap_eff, (int)ce->n_cap_prm,
-		       (int)ce->n_cap_bnd);
-		return ERR_PTR(-EINVAL);
-	}
 
 	this_pos = rst_mem_align_cpos(RM_PRIVATE);
 
@@ -3599,10 +3611,10 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	args->creds.groups = NULL;
 	args->creds.lsm_profile = NULL;
 
-	memcpy(args->cap_inh, ce->cap_inh, sizeof(args->cap_inh));
-	memcpy(args->cap_eff, ce->cap_eff, sizeof(args->cap_eff));
-	memcpy(args->cap_prm, ce->cap_prm, sizeof(args->cap_prm));
-	memcpy(args->cap_bnd, ce->cap_bnd, sizeof(args->cap_bnd));
+	copy_caps(args->cap_inh, ce->cap_inh, ce->n_cap_inh);
+	copy_caps(args->cap_eff, ce->cap_eff, ce->n_cap_eff);
+	copy_caps(args->cap_prm, ce->cap_prm, ce->n_cap_prm);
+	copy_caps(args->cap_bnd, ce->cap_bnd, ce->n_cap_bnd);
 
 	if (ce->n_groups && !groups_match(ce->groups, ce->n_groups)) {
 		unsigned int *groups;

@@ -6,9 +6,9 @@
 set -e
 set -x
 
-VAGRANT_VERSION=2.2.19
-FEDORA_VERSION=37
-FEDORA_BOX_VERSION=37.20221105.0
+VAGRANT_VERSION=2.3.7
+FEDORA_VERSION=38
+FEDORA_BOX_VERSION=38.20230413.1
 
 setup() {
 	if [ -n "$TRAVIS" ]; then
@@ -19,7 +19,7 @@ setup() {
 	# Tar up the git checkout to have vagrant rsync it to the VM
 	tar cf criu.tar ../../../criu
 	# Cirrus has problems with the following certificate.
-	wget --no-check-certificate https://releases.hashicorp.com/vagrant/${VAGRANT_VERSION}/vagrant_${VAGRANT_VERSION}_"$(uname -m)".deb -O /tmp/vagrant.deb && \
+	wget --no-check-certificate https://releases.hashicorp.com/vagrant/${VAGRANT_VERSION}/vagrant_${VAGRANT_VERSION}-1_"$(dpkg --print-architecture)".deb -O /tmp/vagrant.deb && \
 		dpkg -i /tmp/vagrant.deb
 
 	./apt-install libvirt-clients libvirt-daemon-system libvirt-dev qemu-utils qemu \
@@ -38,7 +38,7 @@ setup() {
 	ssh default sudo dnf upgrade -y
 	ssh default sudo dnf install -y gcc git gnutls-devel nftables-devel libaio-devel \
 		libasan libcap-devel libnet-devel libnl3-devel libbsd-devel make protobuf-c-devel \
-		protobuf-devel python3-flake8 python3-future python3-protobuf python3-importlib-metadata \
+		protobuf-devel python3-flake8 python3-protobuf python3-importlib-metadata \
 		python3-junit_xml rubygem-asciidoctor iptables libselinux-devel libbpf-devel
 	# Disable sssd to avoid zdtm test failures in pty04 due to sssd socket
 	ssh default sudo systemctl mask sssd
