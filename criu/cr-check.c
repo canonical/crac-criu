@@ -21,6 +21,7 @@
 #include <sys/prctl.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/utsname.h>
 
 #include "../soccr/soccr.h"
 
@@ -29,7 +30,7 @@
 #include "sockets.h"
 #include "crtools.h"
 #include "log.h"
-#include "util-pie.h"
+#include "util-caps.h"
 #include "prctl.h"
 #include "files.h"
 #include "sk-inet.h"
@@ -104,7 +105,7 @@ out:
 
 static int check_apparmor_stacking(void)
 {
-	if (!check_aa_ns_dumping())
+	if (!kdat.apparmor_ns_dumping_enabled)
 		return -1;
 
 	return 0;
@@ -514,6 +515,14 @@ err:
 static int check_ipc(void)
 {
 	int ret;
+
+	/*
+	 * Since kernel 5.16 sem_next_id can be accessed via CAP_CHECKPOINT_RESTORE, however
+	 * for non-root users access() runs with an empty set of caps and will therefore always
+	 * fail.
+	 */
+	if (opts.uid)
+		return 0;
 
 	ret = access("/proc/sys/kernel/sem_next_id", R_OK | W_OK);
 	if (!ret)
@@ -1039,10 +1048,14 @@ static int check_tcp(void)
 	}
 
 	val = 1;
-	ret = setsockopt(sk, SOL_TCP, TCP_REPAIR, &val, sizeof(val));
-	if (ret < 0) {
-		pr_perror("Can't turn TCP repair mode ON");
-		goto out;
+	if (!opts.unprivileged || has_cap_net_admin(opts.cap_eff)) {
+		ret = setsockopt(sk, SOL_TCP, TCP_REPAIR, &val, sizeof(val));
+		if (ret < 0) {
+			pr_perror("Can't turn TCP repair mode ON");
+			goto out;
+		}
+	} else {
+		pr_info("Not checking for TCP repair mode. Please set CAP_NET_ADMIN\n");
 	}
 
 	optlen = sizeof(val);
@@ -1073,6 +1086,8 @@ static int kerndat_tcp_repair_window(void)
 	int sk, val = 1;
 
 	sk = socket(AF_INET, SOCK_STREAM, 0);
+	if (sk < 0 && errno == EAFNOSUPPORT)
+		sk = socket(AF_INET6, SOCK_STREAM, 0);
 	if (sk < 0) {
 		pr_perror("Unable to create inet socket");
 		goto errn;
@@ -1180,7 +1195,7 @@ static int check_ipt_legacy(void)
 	char *ipt_legacy_bin;
 	char *ip6t_legacy_bin;
 
-	ipt_legacy_bin = get_legacy_iptables_bin(false);
+	ipt_legacy_bin = get_legacy_iptables_bin(false, false);
 	if (!ipt_legacy_bin) {
 		pr_warn("Couldn't find iptables version which is using iptables legacy API\n");
 		return -1;
@@ -1191,7 +1206,7 @@ static int check_ipt_legacy(void)
 	if (!kdat.ipv6)
 		return 0;
 
-	ip6t_legacy_bin = get_legacy_iptables_bin(true);
+	ip6t_legacy_bin = get_legacy_iptables_bin(true, false);
 	if (!ip6t_legacy_bin) {
 		pr_warn("Couldn't find ip6tables version which is using iptables legacy API\n");
 		return -1;
@@ -1311,9 +1326,6 @@ static int check_pidfd_store(void)
 
 static int check_ns_pid(void)
 {
-	if (kerndat_has_nspid() < 0)
-		return -1;
-
 	if (!kdat.has_nspid)
 		return -1;
 
@@ -1362,6 +1374,14 @@ static int check_openat2(void)
 	return 0;
 }
 
+static int check_ipv6_freebind(void)
+{
+	if (!kdat.has_ipv6_freebind)
+		return -1;
+
+	return 0;
+}
+
 static int (*chk_feature)(void);
 
 /*
@@ -1393,9 +1413,6 @@ int cr_check(void)
 {
 	struct ns_id *ns;
 	int ret = 0;
-
-	if (!is_root_user())
-		return -1;
 
 	root_item = alloc_pstree_item();
 	if (root_item == NULL)
@@ -1478,13 +1495,16 @@ int cr_check(void)
 		ret |= check_newifindex();
 		ret |= check_pidfd_store();
 		ret |= check_ns_pid();
-		ret |= check_apparmor_stacking();
 		ret |= check_network_lock_nftables();
 		ret |= check_sockopt_buf_lock();
 		ret |= check_memfd_hugetlb();
 		ret |= check_move_mount_set_group();
 		ret |= check_openat2();
 		ret |= check_ptrace_get_rseq_conf();
+		ret |= check_ipv6_freebind();
+
+		if (kdat.lsm == LSMTYPE__APPARMOR)
+			ret |= check_apparmor_stacking();
 	}
 
 	/*
@@ -1602,6 +1622,7 @@ static struct feature_list feature_list[] = {
 	{ "move_mount_set_group", check_move_mount_set_group },
 	{ "openat2", check_openat2 },
 	{ "get_rseq_conf", check_ptrace_get_rseq_conf },
+	{ "ipv6_freebind", check_ipv6_freebind },
 	{ NULL, NULL },
 };
 
@@ -1652,4 +1673,55 @@ static char *feature_name(int (*func)(void))
 			return fl->name;
 	}
 	return NULL;
+}
+
+static int pr_set_dumpable(int value)
+{
+	int ret = prctl(PR_SET_DUMPABLE, value, 0, 0, 0);
+	if (ret < 0)
+		pr_perror("Unable to set PR_SET_DUMPABLE");
+	return ret;
+}
+
+int check_caps(void)
+{
+	/* Read out effective capabilities and store in opts.cap_eff. */
+	if (set_opts_cap_eff())
+		goto out;
+
+	/*
+	 * No matter if running as root or not. CRIU always needs
+	 * at least these capabilities.
+	 */
+	if (!has_cap_checkpoint_restore(opts.cap_eff))
+		goto out;
+
+	/* For some things we need to know if we are running as root. */
+	opts.uid = geteuid();
+
+	if (!opts.uid) {
+		/* CRIU is running as root. No further checks are necessary. */
+		return 0;
+	}
+
+	if (!opts.unprivileged) {
+		pr_msg("Running as non-root requires '--unprivileged'\n");
+		pr_msg("Please consult the documentation for limitations when running as non-root\n");
+		return -1;
+	}
+
+	/*
+	 * At his point we know we are running as non-root with the necessary
+	 * capabilities available. Now we have to make the process dumpable
+	 * so that /proc/self is not owned by root.
+	 */
+	if (pr_set_dumpable(1))
+		return -1;
+
+	return 0;
+out:
+	pr_msg("CRIU needs to have the CAP_SYS_ADMIN or the CAP_CHECKPOINT_RESTORE capability: \n");
+	pr_msg("setcap cap_checkpoint_restore+eip %s\n", opts.argv_0);
+
+	return -1;
 }

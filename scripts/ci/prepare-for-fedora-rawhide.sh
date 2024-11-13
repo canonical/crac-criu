@@ -24,9 +24,10 @@ dnf install -y \
 	protobuf-devel \
 	python3-flake8 \
 	python3-PyYAML \
-	python3-future \
 	python3-protobuf \
 	python3-junit_xml \
+	python3-pip \
+	python3-importlib-metadata \
 	python-unversioned-command \
 	redhat-rpm-config \
 	sudo \
@@ -34,6 +35,7 @@ dnf install -y \
 	which \
 	e2fsprogs \
 	rubygem-asciidoctor \
+	libdrm-devel \
 	kmod
 
 # /tmp is no longer 755 in the rawhide container image and breaks CI - fix it

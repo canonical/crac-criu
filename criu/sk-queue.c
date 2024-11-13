@@ -325,7 +325,7 @@ int restore_sk_queue(int fd, unsigned int peer_id)
 	int ret = -1;
 
 	pr_info("Trying to restore recv queue for %u\n", peer_id);
-
+        pr_perror("restore_sk_queue");
 	if (restore_prepare_socket(fd))
 		goto out;
 

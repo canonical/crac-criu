@@ -59,9 +59,7 @@ void flush_early_log_buffer(int fd);
 #ifndef CR_NOGLIBC
 
 #define pr_perror(fmt, ...) pr_err(fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
-
-#define pr_pwarn(fmt, ...)						\
-	pr_warn(fmt ": %m\n", ##__VA_ARGS__)
+#define pr_pwarn(fmt, ...) pr_warn(fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
 
 #endif /* CR_NOGLIBC */
 

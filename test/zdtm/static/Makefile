@@ -62,6 +62,7 @@ TST_NOFILE	:=				\
 		pthread_timers			\
 		pthread_timers_h		\
 		rseq00				\
+		membarrier			\
 		vdso00				\
 		vdso01				\
 		vdso02				\
@@ -123,6 +124,8 @@ TST_NOFILE	:=				\
 		sock_opts00			\
 		sock_opts01			\
 		sock_opts02			\
+		sock_ip_opts00			\
+		sock_ip_opts01			\
 		sk-unix-unconn			\
 		sk-unix-unconn-seqpacket	\
 		ipc_namespace			\
@@ -184,6 +187,8 @@ TST_NOFILE	:=				\
 		stopped01			\
 		stopped02			\
 		stopped12			\
+		stopped03			\
+		stopped04			\
 		rtc				\
 		clean_mntns			\
 		mntns_rw_ro_rw			\
@@ -199,6 +204,7 @@ TST_NOFILE	:=				\
 		scm04				\
 		scm05				\
 		scm06				\
+		scm09				\
 		aio00				\
 		aio01				\
 		fd				\
@@ -210,6 +216,7 @@ TST_NOFILE	:=				\
 		seccomp_filter_tsync			\
 		seccomp_filter_threads			\
 		seccomp_filter_inheritance		\
+		seccomp_no_new_privs		\
 		different_creds			\
 		vsx				\
 		bridge				\
@@ -251,6 +258,8 @@ TST_NOFILE	:=				\
 		memfd02				\
 		memfd02-hugetlb			\
 		memfd03				\
+		memfd04				\
+		memfd05				\
 		shmemfd				\
 		shmemfd-priv			\
 		time				\
@@ -260,6 +269,7 @@ TST_NOFILE	:=				\
 		sigtrap				\
 		sigtrap01			\
 		change_mnt_context		\
+		fd_offset			\
 #		jobctl00			\
 
 PKG_CONFIG ?= pkg-config
@@ -303,6 +313,10 @@ TST_FILE	=				\
 		ghost_holes00			\
 		ghost_holes01			\
 		ghost_holes02			\
+		ghost_holes_large00     \
+		ghost_holes_large01     \
+		ghost_multi_hole00      \
+		ghost_multi_hole01      \
 		unlink_largefile		\
 		mtime_mmap			\
 		fifo				\
@@ -347,6 +361,10 @@ TST_FILE	=				\
 		socket_close_data01		\
 		fifo_upon_unix_socket00		\
 		fifo_upon_unix_socket01		\
+		sk-unix-listen01		\
+		sk-unix-listen02		\
+		sk-unix-listen03		\
+		sk-unix-listen04		\
 
 TST_DIR		=				\
 		cwd00				\
@@ -377,6 +395,8 @@ TST_DIR		=				\
 		cgroup02			\
 		cgroup03			\
 		cgroup04			\
+		cgroupv2_00			\
+		cgroupv2_01			\
 		cgroup_ifpriomap		\
 		cgroup_ignore			\
 		cgroup_stray			\
@@ -585,6 +605,7 @@ socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV6
 socket-tcp6-closed:	CFLAGS += -D ZDTM_IPV4V6
 socket-tcp-closed-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK
 socket-tcp-skip-in-flight:	CFLAGS += -D ZDTM_IPV4V6
+sock_ip_opts01:		CFLAGS += -DZDTM_VAL_ZERO
 tun_ns:			CFLAGS += -DTUN_NS
 mnt_ext_manual:		CFLAGS += -D ZDTM_EXTMAP_MANUAL
 mntns_pivot_root_ro:	CFLAGS += -DMNTNS_PIVOT_ROOT_RO
@@ -593,6 +614,7 @@ vdso01:			LDLIBS += -lrt
 scm01:			CFLAGS += -DKEEP_SENT_FD
 scm02:			CFLAGS += -DSEND_BOTH
 scm04:			CFLAGS += -DSEPARATE
+scm09:			CFLAGS += -DCLOSE_SENDER_FD
 mntns_link_remap:	CFLAGS += -DZDTM_LINK_REMAP
 mntns_shared_bind02:	CFLAGS += -DSHARED_BIND02
 mntns_root_bind02:	CFLAGS += -DROOT_BIND02
@@ -605,6 +627,7 @@ unlink_fstat04:		CFLAGS += -DUNLINK_FSTAT04
 unlink_fstat041:		CFLAGS += -DUNLINK_FSTAT041 -DUNLINK_FSTAT04
 ghost_holes01:		CFLAGS += -DTAIL_HOLE
 ghost_holes02:		CFLAGS += -DHEAD_HOLE
+ghost_holes_large01:		CFLAGS += -DLIMIT
 sk-freebind-false:	CFLAGS += -DZDTM_FREEBIND_FALSE
 selinux02:		CFLAGS += -DUSING_SOCKCREATE
 stopped01:		CFLAGS += -DZDTM_STOPPED_KILL
@@ -635,6 +658,7 @@ socket-tcp6-unconn:	CFLAGS += -D ZDTM_IPV6
 socket-tcp4v6-last-ack:	CFLAGS += -D ZDTM_TCP_LAST_ACK -D ZDTM_IPV4V6
 socket-tcp4v6-closing:	CFLAGS += -D ZDTM_IPV4V6
 memfd02-hugetlb:	CFLAGS += -D ZDTM_HUGETLB
+memfd05:		CFLAGS += -D ZDTM_MEMFD05
 
 sockets00-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
 sockets01-seqpacket:	CFLAGS += -D ZDTM_UNIX_SEQPACKET
@@ -662,6 +686,12 @@ bpf_hash:		LDLIBS += -lbpf
 bpf_array:		LDLIBS += -lbpf
 
 fifo_upon_unix_socket01:	CFLAGS += -DFIFO_UPON_UNIX01
+
+sk-unix-listen02: CFLAGS += -DSK_UNIX_LISTEN02
+sk-unix-listen03: CFLAGS += -DSK_UNIX_LISTEN03
+sk-unix-listen04: CFLAGS += -DSK_UNIX_LISTEN02 -DSK_UNIX_LISTEN03
+
+cgroupv2_01:		LDLIBS += -pthread
 
 $(LIB):	force
 	$(Q) $(MAKE) -C $(LIBDIR)

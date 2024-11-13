@@ -115,6 +115,10 @@ static int alloc_groups_copy_creds(CredsEntry *ce, struct parasite_dump_creds *c
 	memcpy(ce->cap_eff, c->cap_eff, sizeof(c->cap_eff[0]) * CR_CAP_SIZE);
 	memcpy(ce->cap_bnd, c->cap_bnd, sizeof(c->cap_bnd[0]) * CR_CAP_SIZE);
 
+	if (c->no_new_privs > 0) {
+		ce->no_new_privs = c->no_new_privs;
+		ce->has_no_new_privs = true;
+	}
 	ce->secbits = c->secbits;
 	ce->n_groups = c->ngroups;
 
@@ -195,13 +199,13 @@ int parasite_dump_thread_seized(struct parasite_thread_ctl *tctl, struct parasit
 	ret = compel_get_thread_regs(tctl, save_task_regs, core);
 	if (ret) {
 		pr_err("Can't obtain regs for thread %d\n", pid);
-		goto err_rth;
+		return -1;
 	}
 
 	ret = compel_arch_fetch_thread_area(tctl);
 	if (ret) {
 		pr_err("Can't obtain thread area of %d\n", pid);
-		goto err_rth;
+		return -1;
 	}
 
 	compel_arch_get_tls_thread(tctl, &args->tls);
@@ -211,23 +215,17 @@ int parasite_dump_thread_seized(struct parasite_thread_ctl *tctl, struct parasit
 	ret = compel_run_in_thread(tctl, PARASITE_CMD_DUMP_THREAD);
 	if (ret) {
 		pr_err("Can't init thread in parasite %d\n", pid);
-		goto err_rth;
+		return -1;
 	}
 
 	ret = alloc_groups_copy_creds(creds, pc);
 	if (ret) {
 		pr_err("Can't copy creds for thread %d\n", pid);
-		goto err_rth;
+		return -1;
 	}
-
-	compel_release_thread(tctl);
 
 	tid->ns[0].virt = args->tid;
 	return dump_thread_core(pid, core, args);
-
-err_rth:
-	compel_release_thread(tctl);
-	return -1;
 }
 
 int parasite_dump_sigacts_seized(struct parasite_ctl *ctl, struct pstree_item *item)
@@ -435,6 +433,7 @@ int parasite_dump_misc_seized(struct parasite_ctl *ctl, struct parasite_dump_mis
 	struct parasite_dump_misc *ma;
 
 	ma = compel_parasite_args(ctl, struct parasite_dump_misc);
+	ma->has_membarrier_get_registrations = kdat.has_membarrier_get_registrations;
 	if (compel_rpc_call_sync(PARASITE_CMD_DUMP_MISC, ctl) < 0)
 		return -1;
 
@@ -513,6 +512,7 @@ int parasite_dump_cgroup(struct parasite_ctl *ctl, struct parasite_dump_cgroup_a
 	struct parasite_dump_cgroup_args *ca;
 
 	ca = compel_parasite_args(ctl, struct parasite_dump_cgroup_args);
+	memcpy(ca->thread_cgrp, cgroup->thread_cgrp, sizeof(ca->thread_cgrp));
 	ret = compel_rpc_call_sync(PARASITE_CMD_DUMP_CGROUP, ctl);
 	if (ret) {
 		pr_err("Parasite failed to dump /proc/self/cgroup\n");

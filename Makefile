@@ -19,7 +19,7 @@ endif
 
 #
 # Supported Architectures
-ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips,$(ARCH)),)
+ifneq ($(filter-out x86 arm aarch64 ppc64 s390 mips loongarch64,$(ARCH)),)
         $(error "The architecture $(ARCH) isn't supported")
 endif
 
@@ -35,18 +35,18 @@ ifeq ($(ARCH),arm)
         ARMV		:= $(shell echo $(SUBARCH) | sed -nr 's/armv([[:digit:]]).*/\1/p; t; i7')
 
         ifeq ($(ARMV),6)
-                USERCFLAGS += -march=armv6
+                ARCHCFLAGS += -march=armv6
         endif
 
         ifeq ($(ARMV),7)
-                USERCFLAGS += -march=armv7-a+fp
+                ARCHCFLAGS += -march=armv7-a+fp
         endif
 
         ifeq ($(ARMV),8)
                 # Running 'setarch linux32 uname -m' returns armv8l on travis aarch64.
                 # This tells CRIU to handle armv8l just as armv7hf. Right now this is
                 # only used for compile testing. No further verification of armv8l exists.
-                USERCFLAGS += -march=armv7-a
+                ARCHCFLAGS += -march=armv7-a
                 ARMV := 7
         endif
 
@@ -80,6 +80,10 @@ ifeq ($(ARCH),mips)
         DEFINES		:= -DCONFIG_MIPS
 endif
 
+ifeq ($(ARCH),loongarch64)
+        DEFINES		:= -DCONFIG_LOONGARCH64
+endif
+
 #
 # CFLAGS_PIE:
 #
@@ -105,6 +109,7 @@ DEFINES			+= -D_FILE_OFFSET_BITS=64
 DEFINES			+= -D_GNU_SOURCE
 
 WARNINGS		:= -Wall -Wformat-security -Wdeclaration-after-statement -Wstrict-prototypes
+WARNINGS		+= -Wno-format-truncation -Wno-stringop-overflow
 
 # -Wdangling-pointer results in false warning when we add a list element to
 # local list head variable. It is false positive because before leaving the
@@ -120,6 +125,10 @@ export CFLAGS-GCOV
 
 ifeq ($(ARCH),mips)
 WARNINGS		:= -rdynamic
+endif
+
+ifeq ($(ARCH),loongarch64)
+WARNINGS		:= -Wno-implicit-function-declaration
 endif
 
 ifneq ($(GCOV),)
@@ -151,7 +160,7 @@ export GMON GMONLDOPT
 endif
 
 AFLAGS			+= -D__ASSEMBLY__
-CFLAGS			+= $(USERCFLAGS) $(WARNINGS) $(DEFINES) -iquote include/
+CFLAGS			+= $(USERCFLAGS) $(ARCHCFLAGS) $(WARNINGS) $(DEFINES) -iquote include/
 HOSTCFLAGS		+= $(WARNINGS) $(DEFINES) -iquote include/
 export AFLAGS CFLAGS USERCLFAGS HOSTCFLAGS
 
@@ -272,26 +281,19 @@ criu: $(criu-deps)
 	$(Q) $(MAKE) $(build)=criu all
 .PHONY: criu
 
-crit/Makefile: ;
-crit/%: criu .FORCE
-	$(Q) $(MAKE) $(build)=crit $@
-crit: criu
-	$(Q) $(MAKE) $(build)=crit all
-.PHONY: crit
-
 unittest: $(criu-deps)
 	$(Q) $(MAKE) $(build)=criu unittest
 .PHONY: unittest
 
 
 #
-# Libraries next once crit it ready
+# Libraries next once criu is ready
 # (we might generate headers and such
 # when building criu itself).
 lib/Makefile: ;
-lib/%: crit .FORCE
+lib/%: criu .FORCE
 	$(Q) $(MAKE) $(build)=lib $@
-lib: crit
+lib: criu
 	$(Q) $(MAKE) $(build)=lib all
 .PHONY: lib
 
@@ -300,10 +302,9 @@ clean mrproper:
 	$(Q) $(MAKE) $(build)=criu $@
 	$(Q) $(MAKE) $(build)=soccr $@
 	$(Q) $(MAKE) $(build)=lib $@
+	$(Q) $(MAKE) $(build)=crit $@
 	$(Q) $(MAKE) $(build)=compel $@
 	$(Q) $(MAKE) $(build)=compel/plugins $@
-	$(Q) $(MAKE) $(build)=lib $@
-	$(Q) $(MAKE) $(build)=crit $@
 	$(Q) $(MAKE) -C lz4 clean
 	rm -rf $(LZ4_OBJS)
 .PHONY: clean mrproper
@@ -351,6 +352,10 @@ test: zdtm
 amdgpu_plugin: criu
 	$(Q) $(MAKE) -C plugins/amdgpu all
 .PHONY: amdgpu_plugin
+
+crit: lib
+	$(Q) $(MAKE) -C crit
+.PHONY: crit
 
 #
 # Generating tar requires tag matched CRIU_VERSION.
@@ -417,6 +422,7 @@ help:
 	@echo '    Targets:'
 	@echo '      all             - Build all [*] targets'
 	@echo '    * criu            - Build criu'
+	@echo '    * crit            - Build crit'
 	@echo '      zdtm            - Build zdtm test-suite'
 	@echo '      docs            - Build documentation'
 	@echo '      install         - Install CRIU (see INSTALL.md)'
@@ -440,24 +446,30 @@ lint:
 	flake8 --config=scripts/flake8.cfg test/zdtm.py
 	flake8 --config=scripts/flake8.cfg test/inhfd/*.py
 	flake8 --config=scripts/flake8.cfg test/others/rpc/config_file.py
-	flake8 --config=scripts/flake8.cfg lib/py/images/pb2dict.py
+	flake8 --config=scripts/flake8.cfg lib/pycriu/images/pb2dict.py
+	flake8 --config=scripts/flake8.cfg lib/pycriu/images/images.py
 	flake8 --config=scripts/flake8.cfg scripts/criu-ns
-	flake8 --config=scripts/flake8.cfg scripts/crit-setup.py
-	flake8 --config=scripts/flake8.cfg coredump/
+	flake8 --config=scripts/flake8.cfg test/others/criu-ns/run.py
+	flake8 --config=scripts/flake8.cfg crit/*.py
+	flake8 --config=scripts/flake8.cfg crit/crit/*.py
+	flake8 --config=scripts/flake8.cfg scripts/uninstall_module.py
+	flake8 --config=scripts/flake8.cfg coredump/ coredump/coredump
+	flake8 --config=scripts/flake8.cfg scripts/github-indent-warnings.py
 	shellcheck --version
 	shellcheck scripts/*.sh
 	shellcheck scripts/ci/*.sh scripts/ci/apt-install
-	shellcheck test/others/crit/*.sh
-	shellcheck test/others/libcriu/*.sh
-	shellcheck test/others/crit/*.sh test/others/criu-coredump/*.sh
-	shellcheck test/others/config-file/*.sh
-	codespell
-	# Do not append \n to pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*\\n"'
-	# Do not use %m with pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>.*%m'
-	# Do not use errno with pr_perror or fail
-	! git --no-pager grep -E '^\s*\<(pr_perror|fail)\>\(".*".*errno'
+	shellcheck -x test/others/crit/*.sh
+	shellcheck -x test/others/libcriu/*.sh
+	shellcheck -x test/others/crit/*.sh test/others/criu-coredump/*.sh
+	shellcheck -x test/others/config-file/*.sh
+	shellcheck -x test/others/action-script/*.sh
+	codespell -S tags
+	# Do not append \n to pr_perror, pr_pwarn or fail
+	! git --no-pager grep -E '^\s*\<(pr_perror|pr_pwarn|fail)\>.*\\n"'
+	# Do not use %m with pr_* or fail
+	! git --no-pager grep -E '^\s*\<(pr_(err|perror|warn|pwarn|debug|info|msg)|fail)\>.*%m'
+	# Do not use errno with pr_perror, pr_pwarn or fail
+	! git --no-pager grep -E '^\s*\<(pr_perror|pr_pwarn|fail)\>\(".*".*errno'
 	# End pr_(err|warn|msg|info|debug) with \n
 	! git --no-pager grep -En '^\s*\<pr_(err|warn|msg|info|debug)\>.*);$$' | grep -v '\\n'
 	# No EOL whitespace for C files
@@ -475,8 +487,10 @@ fetch-clang-format: .FORCE
 	$(E) ".clang-format"
 	$(Q) scripts/fetch-clang-format.sh
 
+BASE ?= "HEAD~1"
+OPTS ?= "--quiet"
 indent:
-	find . -name '*.[ch]' -type f -print0 | xargs --null --max-args 128 --max-procs 4 clang-format -i
+	git clang-format --style file --extensions c,h $(OPTS) $(BASE)
 .PHONY: indent
 
 include Makefile.install

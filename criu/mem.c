@@ -161,7 +161,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * put the memory into the page-pipe's pipe.
  *
  * "Holes" in page-pipe are regions, that should be dumped, but
- * the memory contents is present in the pagent image set.
+ * the memory contents is present in the parent image set.
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, u64 *map, u64 *off,
@@ -245,6 +245,12 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * so we ignore them at pre-dump.
 		 */
 		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
+			continue;
+		/*
+		 * We totally ignore MAP_HUGETLB on pre-dump.
+		 * See also generate_vma_iovs() comment.
+		 */
+		if ((vma->e->flags & MAP_HUGETLB) && skip_non_trackable)
 			continue;
 		if (vma->e->prot & PROT_READ)
 			continue;
@@ -402,7 +408,14 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			has_parent = false;
 	}
 
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING)) {
+	/*
+	 * We want to completely ignore these VMA types on the pre-dump:
+	 * 1. VMA_AREA_AIORING because it is not soft-dirty trackable (kernel writes)
+	 * 2. MAP_HUGETLB mappings because they are not premapped and we can't use
+	 * parent images from pre-dump stages. Instead, the content is restored from
+	 * the parasite context using full memory image.
+	 */
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;
@@ -1204,8 +1217,6 @@ err_addr:
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 {
-	MmEntry *mm = rsti(t)->mm;
-
 	/*
 	 * There is no need to disable it if the page read doesn't
 	 * have parent. In this case VMA will be empty until
@@ -1228,8 +1239,6 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 		pr_perror("Cannot disable THP");
 		return -1;
 	}
-	if (!(mm->has_thp_disabled && mm->thp_disabled))
-		rsti(t)->has_thp_enabled = true;
 
 	return 0;
 }

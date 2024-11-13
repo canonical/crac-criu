@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# shellcheck disable=SC1091,SC2015
-
 set -x -e -o pipefail
 
 ./apt-install \
@@ -17,30 +15,21 @@ add-apt-repository \
    $(lsb_release -cs) \
    stable test"
 
-./apt-install docker-ce
+./apt-install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
+# shellcheck source=/dev/null
 . /etc/lsb-release
 
-# overlayfs with current Ubuntu kernel breaks CRIU
-# https://bugs.launchpad.net/ubuntu/+source/linux-azure/+bug/1967924
-# Use devicemapper storage drive as a work-around
-echo '{ "experimental": true, "storage-driver": "devicemapper" }' > /etc/docker/daemon.json
+# docker checkpoint and restore is an experimental feature
+echo '{ "experimental": true }' > /etc/docker/daemon.json
+service docker restart
 
 CRIU_LOG='/criu.log'
 mkdir -p /etc/criu
 echo "log-file=$CRIU_LOG" > /etc/criu/runc.conf
 
-service docker stop
-systemctl stop containerd.service
-
-# Always use the latest containerd release.
-# Restore with containerd versions after v1.2.14 and before v1.5.0-beta.0 are broken.
-# https://github.com/checkpoint-restore/criu/issues/1223
-CONTAINERD_DOWNLOAD_URL=$(curl -s https://api.github.com/repos/containerd/containerd/releases/latest | grep '"browser_download_url":.*/containerd-.*-linux-amd64.tar.gz.$' | cut -d\" -f4)
-wget -nv "$CONTAINERD_DOWNLOAD_URL" -O - | tar -xz -C /usr/
-
-systemctl restart containerd.service
-service docker restart
+# Test checkpoint/restore with action script
+echo "action-script /usr/bin/true" | sudo tee /etc/criu/default.conf
 
 export SKIP_CI_TEST=1
 
@@ -88,17 +77,37 @@ checkpoint_container () {
 	docker wait cr
 }
 
-restore_container () {
-	CHECKPOINT_NAME=$1
-
-	docker start --checkpoint "$CHECKPOINT_NAME" cr 2>&1 | tee log || {
+print_logs () {
 	cat "$(grep log 'log file:' | sed 's/log file:\s*//')" || true
 		docker logs cr || true
 		cat $CRIU_LOG || true
 		dmesg
 		docker ps
 		exit 1
-	}
+}
+
+declare -i max_restore_container_tries=3
+current_iteration=
+
+restore_container () {
+	CHECKPOINT_NAME=$1
+
+	docker start --checkpoint "$CHECKPOINT_NAME" cr 2>&1 | tee log || {
+		# FIXME: There is a race condition in docker/containerd that causes
+		# docker to occasionally fail when starting a container from a
+		# checkpoint immediately after the checkpoint has been created.
+		# https://github.com/moby/moby/issues/42900
+		if [ "$current_iteration" -gt "$max_restore_container_tries" ]; then
+			print_logs
+		fi
+		grep -Eq '^Error response from daemon: failed to upload checkpoint to containerd: commit failed: content sha256:.*: already exists$' log && {
+			((current_iteration+=1))
+			echo "Retry container restore: $current_iteration"
+			sleep 1;
+			restore_container "$CHECKPOINT_NAME"
+		} ||
+		print_logs
+	} && current_iteration=0
 }
 
 # Scenario: Create multiple containers and checkpoint and restore them once

@@ -1,10 +1,4 @@
-#!/usr/bin/env python
-from __future__ import (
-    absolute_import,
-    division,
-    print_function,
-    unicode_literals
-)
+#!/usr/bin/env python3
 
 import argparse
 import atexit
@@ -40,6 +34,8 @@ STREAMED_IMG_FILE_NAME = "img.criu"
 
 prev_line = None
 uuid = uuid.uuid4()
+
+NON_ROOT_UID = 65534
 
 
 def alarm(*args):
@@ -77,7 +73,8 @@ def clean_tests_root():
 def make_tests_root():
     global tests_root
     if not tests_root:
-        tests_root = (os.getpid(), tempfile.mkdtemp("", "criu-root-", "/tmp"))
+        tmpdir = os.environ.get("TMPDIR", "/tmp")
+        tests_root = (os.getpid(), tempfile.mkdtemp("", "criu-root-", tmpdir))
         atexit.register(clean_tests_root)
         os.mkdir(os.path.join(tests_root[1], "root"))
     os.chmod(tests_root[1], 0o777)
@@ -267,7 +264,7 @@ class ns_flavor:
 
     def init(self, l_bins, x_bins):
         subprocess.check_call(
-            ["mount", "--make-slave", "--bind", ".", self.root])
+            ["mount", "--make-private", "--bind", ".", self.root])
         self.root_mounted = True
 
         if not os.access(self.root + "/.constructed", os.F_OK):
@@ -392,19 +389,20 @@ class test_fail_expected_exc(Exception):
 
 
 class zdtm_test:
-    def __init__(self, name, desc, flavor, freezer):
+    def __init__(self, name, desc, flavor, freezer, rootless):
         self.__name = name
         self.__desc = desc
         self.__freezer = None
+        self.__timeout = int(self.__desc.get('timeout') or 30)
+        self.__rootless = rootless
         self.__make_action('cleanout')
         self.__pid = 0
         self.__flavor = flavor
         self.__freezer = freezer
         self._bins = [name]
-        self._env = {}
+        self._env = {'TMPDIR': os.environ.get('TMPDIR', '/tmp')}
         self._deps = desc.get('deps', [])
         self.auto_reap = True
-        self.__timeout = int(self.__desc.get('timeout') or 30)
 
     def __make_action(self, act, env=None, root=None):
         sys.stdout.flush()  # Not to let make's messages appear before ours
@@ -426,7 +424,7 @@ class zdtm_test:
             preexec_fn=self.__freezer and self.__freezer.attach or None)
         if act == "pid":
             try_run_hook(self, ["--post-start"])
-        if s.wait():
+        if s.wait(timeout=self.__timeout):
             raise test_fail_exc(str(s_args))
 
         if self.__freezer:
@@ -439,6 +437,8 @@ class zdtm_test:
         wait_pid_die(int(self.__pid), self.__name, self.__timeout)
 
     def __add_wperms(self):
+        if os.getuid() != 0:
+            return
         # Add write perms for .out and .pid files
         for b in self._bins:
             p = os.path.dirname(b)
@@ -456,6 +456,9 @@ class zdtm_test:
         if test_flag(self.__desc, 'pre-dump-notify'):
             env['ZDTM_NOTIFY_FDIN'] = "100"
             env['ZDTM_NOTIFY_FDOUT'] = "101"
+
+        if self.__rootless:
+            env['ZDTM_ROOTLESS'] = "1"
 
         if not test_flag(self.__desc, 'suid'):
             # Numbers should match those in criu
@@ -504,8 +507,15 @@ class zdtm_test:
         self.__freezer.thaw()
         if self.__pid:
             print("Send the %d signal to  %s" % (sig, self.__pid))
-            os.kill(int(self.__pid), sig)
-            self.gone(sig == signal.SIGKILL)
+            try:
+                os.kill(int(self.__pid), sig)
+            except ProcessLookupError:
+                if sig != signal.SIGKILL:
+                    raise
+                print("The process %s doesn't exist" % self.__pid)
+                self.gone(True)
+            else:
+                self.gone(sig == signal.SIGKILL)
 
         self.__flavor.fini()
 
@@ -618,29 +628,31 @@ class zdtm_test:
                 ["make", "zdtm_ct"], env=dict(os.environ, MAKEFLAGS=""))
         if not os.access("zdtm/lib/libzdtmtst.a", os.F_OK):
             subprocess.check_call(["make", "-C", "zdtm/"])
+        if 'rootless' in opts and opts['rootless']:
+            return
         subprocess.check_call(
             ["flock", "zdtm_mount_cgroups.lock", "./zdtm_mount_cgroups", str(uuid)])
 
     @staticmethod
     def cleanup():
+        if 'rootless' in opts and opts['rootless']:
+            return
         subprocess.check_call(
             ["flock", "zdtm_mount_cgroups.lock", "./zdtm_umount_cgroups", str(uuid)])
 
 
 def load_module_from_file(name, path):
-    if sys.version_info[0] == 3 and sys.version_info[1] >= 5:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    else:
-        import imp
-        mod = imp.load_source(name, path)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     return mod
 
 
 class inhfd_test:
-    def __init__(self, name, desc, flavor, freezer):
+    def __init__(self, name, desc, flavor, freezer, rootless):
+        if rootless:
+            raise test_fail_exc("This kind of test does not currently support rootless mode")
         self.__name = os.path.basename(name)
         print("Load %s" % name)
         self.__fdtyp = load_module_from_file(self.__name, name)
@@ -801,8 +813,8 @@ class inhfd_test:
 
 
 class groups_test(zdtm_test):
-    def __init__(self, name, desc, flavor, freezer):
-        zdtm_test.__init__(self, 'zdtm/lib/groups', desc, flavor, freezer)
+    def __init__(self, name, desc, flavor, freezer, rootless):
+        zdtm_test.__init__(self, 'zdtm/lib/groups', desc, flavor, freezer, rootless)
         if flavor.ns:
             self.__real_name = name
             with open(name) as fd:
@@ -814,7 +826,7 @@ class groups_test(zdtm_test):
 
         self._bins += self.__subs
         self._deps += get_test_desc('zdtm/lib/groups')['deps']
-        self._env = {'ZDTM_TESTS': self.__real_name}
+        self._env['ZDTM_TESTS'] = self.__real_name
 
     def __get_start_cmd(self, name):
         tdir = os.path.dirname(name)
@@ -824,7 +836,7 @@ class groups_test(zdtm_test):
         subprocess.check_call(s_args + [tname + '.cleanout'])
         s = subprocess.Popen(s_args + ['--dry-run', tname + '.pid'],
                              stdout=subprocess.PIPE)
-        out, _ = s.communicate()
+        out, _ = s.communicate(timeout=self.__timeout)
         cmd = out.decode().splitlines()[-1].strip()
 
         return 'cd /' + tdir + ' && ' + cmd
@@ -868,7 +880,8 @@ class criu_cli:
             fault=None,
             strace=[],
             preexec=None,
-            nowait=False):
+            nowait=False,
+            timeout=60):
         env = dict(
             os.environ,
             ASAN_OPTIONS="log_path=asan.log:disable_coredump=0:detect_leaks=0")
@@ -884,7 +897,7 @@ class criu_cli:
                               preexec_fn=preexec)
         if nowait:
             return cr
-        return cr.wait()
+        return cr.wait(timeout=timeout)
 
 
 class criu_rpc_process:
@@ -967,7 +980,8 @@ class criu_rpc:
             fault=None,
             strace=[],
             preexec=None,
-            nowait=False):
+            nowait=False,
+            timeout=None):
         if fault:
             raise test_fail_exc('RPC and FAULT not supported')
         if strace:
@@ -1039,6 +1053,7 @@ class criu:
         self.__dedup = bool(opts['dedup'])
         self.__mdedup = bool(opts['noauto_dedup'])
         self.__user = bool(opts['user'])
+        self.__rootless = bool(opts['rootless'])
         self.__leave_stopped = bool(opts['stop'])
         self.__stream = bool(opts['stream'])
         self.__show_stats = bool(opts['show_stats'])
@@ -1138,6 +1153,9 @@ class criu:
 
         print("Run criu " + action)
 
+        if self.__rootless:
+            s_args += ["--unprivileged"]
+
         strace = []
         if self.__sat:
             fname = os.path.join(self.__ddir(), action + '.strace')
@@ -1156,7 +1174,10 @@ class criu:
         if action == "restore":
             preexec = None
         else:
-            preexec = self.__user and self.set_user_id or None
+            if os.getuid():
+                preexec = None
+            else:
+                preexec = self.__user and self.set_user_id or None
 
         __ddir = self.__ddir()
 
@@ -1476,10 +1497,11 @@ class criu:
             except Exception:
                 return False
 
-        return criu_cli.run(
-            "check",
-            ["--no-default-config", "--verbosity=0", "--feature", feature],
-            opts['criu_bin']) == 0
+        args = ["--no-default-config", "-verbosity=0", "--feature", feature]
+        if opts['rootless']:
+            args += ["--unprivileged"]
+
+        return criu_cli.run("check", args, opts['criu_bin']) == 0
 
     @staticmethod
     def available():
@@ -1651,6 +1673,15 @@ def get_visible_state(test):
     return files, maps, mounts
 
 
+def has_vsyscall(maps):
+    vsyscall = u"ffffffffff600000-ffffffffff601000"
+    for i in maps:
+        if vsyscall in i:
+            return i
+
+    return None
+
+
 def check_visible_state(test, state, opts):
     new = get_visible_state(test)
 
@@ -1666,9 +1697,9 @@ def check_visible_state(test, state, opts):
         new_maps = new[1][pid]
         if os.getenv("COMPAT_TEST"):
             # the vsyscall vma isn't unmapped from x32 processes
-            vsyscall = u"ffffffffff600000-ffffffffff601000 r-xp"
-            if vsyscall in new_maps and vsyscall not in old_maps:
-                new_maps.remove(vsyscall)
+            entry = has_vsyscall(new_maps)
+            if entry and has_vsyscall(old_maps) is None:
+                new_maps.remove(entry)
         if old_maps != new_maps:
             print("%s: Old maps lost: %s" % (pid, old_maps - new_maps))
             print("%s: New maps appeared: %s" % (pid, new_maps - old_maps))
@@ -1891,7 +1922,7 @@ def do_run_test(tname, tdesc, flavs, opts):
         if opts['dry_run']:
             continue
         flav = flavors[f](opts)
-        t = tclass(tname, tdesc, flav, fcg)
+        t = tclass(tname, tdesc, flav, fcg, opts['rootless'])
         cr_api = criu(opts)
 
         try:
@@ -1979,12 +2010,20 @@ class Launcher:
                   file=self.__file_report)
             print(u"# ", file=self.__file_report)
             print(u"1.." + str(nr_tests), file=self.__file_report)
-        with open("/proc/sys/kernel/tainted") as taintfd:
-            self.__taint = taintfd.read()
+        self.__taint = self.__read_kernel_tainted()
         if int(self.__taint, 0) != 0:
-            print("The kernel is tainted: %r" % self.__taint)
-            if not opts["ignore_taint"] and os.getenv("ZDTM_IGNORE_TAINT") != '1':
-                raise Exception("The kernel is tainted: %r" % self.__taint)
+            self.__report_kernel_taint("The kernel is tainted: %r" % self.__taint)
+
+    @staticmethod
+    def __read_kernel_tainted():
+        with open("/proc/sys/kernel/tainted") as taintfd:
+            return taintfd.read().strip()
+
+    @staticmethod
+    def __report_kernel_taint(msg):
+        print(msg)
+        if not opts["ignore_taint"] and os.getenv("ZDTM_IGNORE_TAINT") != "1":
+            raise Exception(msg)
 
     def __show_progress(self, msg):
         perc = int(self.__nr * 16 / self.__total)
@@ -2010,11 +2049,12 @@ class Launcher:
         if len(self.__subs) >= self.__max:
             self.wait()
 
-        with open("/proc/sys/kernel/tainted") as taintfd:
-            taint = taintfd.read()
+        taint = self.__read_kernel_tainted()
         if self.__taint != taint:
-            raise Exception("The kernel is tainted: %r (%r)" %
-                            (taint, self.__taint))
+            prev_taint = self.__taint
+            self.__taint = taint
+            self.__report_kernel_taint(
+                "The kernel is tainted: %r (was %r)" % (taint, prev_taint))
 
         '''
         The option --link-remap allows criu to hardlink open files back to the
@@ -2042,7 +2082,8 @@ class Launcher:
               'sat', 'script', 'rpc', 'criu_config', 'lazy_pages', 'join_ns',
               'dedup', 'sbs', 'freezecg', 'user', 'dry_run', 'noauto_dedup',
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
-              'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode')
+              'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
+              'rootless')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -2052,6 +2093,9 @@ class Launcher:
             logf = None
             log = None
 
+        if opts['rootless'] and os.getuid() == 0:
+            os.setgid(NON_ROOT_UID)
+            os.setuid(NON_ROOT_UID)
         sub = subprocess.Popen(["./zdtm_ct", "zdtm.py"],
                                env=dict(os.environ, CR_CT_TEST_INFO=arg),
                                stdout=log,
@@ -2193,9 +2237,21 @@ def all_tests(opts):
                 continue
             files.append(fp)
     excl = list(map(lambda x: os.path.join(desc['dir'], x), desc['exclude']))
-    tlist = list(filter(
+    tlist = list(sorted(filter(
         lambda x: not x.endswith('.checkskip') and not x.endswith('.hook') and
-        x not in excl, map(lambda x: x.strip(), files)))
+        x not in excl, map(lambda x: x.strip(), files))))
+
+    if opts.get('test_shard_count'):
+        if opts.get('test_shard_index') is None:
+            raise KeyError('--test_shard_count > 0 must come with --test_shard_index')
+        slice_idx = opts['test_shard_index']
+        slices = opts['test_shard_count']
+        if slice_idx >= slices:
+            raise IndexError('--test_shard_index not less than --test_shard_count ({} >= {})'.format(slice_idx, slices))
+        slist = list(tlist[slice_idx::slices])
+        print("We're shard #{} of {}. Running {} of {} tests.\n".format(slice_idx, slices, len(slist), len(tlist)))
+        tlist = slist
+
     return tlist
 
 
@@ -2306,11 +2362,6 @@ def run_tests(opts):
         return
 
     torun = list(torun)
-    if opts['keep_going'] and len(torun) < 2:
-        print(
-            "[WARNING] Option --keep-going is more useful when running multiple tests"
-        )
-        opts['keep_going'] = False
 
     if opts['exclude']:
         excl = re.compile(".*(" + "|".join(opts['exclude']) + ")")
@@ -2353,6 +2404,7 @@ def run_tests(opts):
                 "Specify --criu-image-streamer-dir or modify PATH to provide an alternate location")
                 .format(streamer_dir))
 
+    usernsIsSupported = criu.check("userns")
     launcher = Launcher(opts, len(torun))
     try:
         for t in torun:
@@ -2422,7 +2474,7 @@ def run_tests(opts):
                 run_flavs = set(test_flavs) & set(opts_flavs)
             else:
                 run_flavs = set([test_flavs.pop()])
-            if not criu.check("userns"):
+            if not usernsIsSupported:
                 run_flavs -= set(['uns'])
             if opts['user']:
                 # FIXME -- probably uns will make sense
@@ -2591,6 +2643,10 @@ def set_nr_hugepages(nr):
         with open("/proc/sys/vm/nr_hugepages", "w") as f:
             f.write("{}\n".format(nr))
         return orig_hugepages
+    except PermissionError as err:
+        # EACCES is expected when running as non-root, otherwise re-raise the exception.
+        if err.errno != errno.EACCES or os.getuid() == 0:
+            raise
     except OSError as err:
         if err.errno != errno.EOPNOTSUPP:
             raise
@@ -2664,6 +2720,10 @@ def get_cli_args():
     rp.add_argument("--freezecg", help="Use freeze cgroup (path:state)")
     rp.add_argument("--user", help="Run CRIU as regular user",
                     action='store_true')
+    rp.add_argument(
+        "--rootless",
+        help="Run CRIU rootless (uid!=0) (needs CAP_CHECKPOINT_RESTORE)",
+        action='store_true')
     rp.add_argument("--rpc",
                     help="Run CRIU via RPC rather than CLI",
                     action='store_true')
@@ -2724,6 +2784,10 @@ def get_cli_args():
     rp.add_argument("--mntns-compat-mode",
                     help="Use old compat mounts restore engine",
                     action='store_true')
+    rp.add_argument("--test-shard-index", type=int, default=None,
+                    help="Select tests for a shard <index> (0-based)")
+    rp.add_argument("--test-shard-count", type=int, default=0,
+                    help="Specify how many shards are being run (0=sharding disabled; must be the same for all shards)")
 
     lp = sp.add_parser("list", help="List tests")
     lp.set_defaults(action=list_tests)

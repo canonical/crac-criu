@@ -313,25 +313,8 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct 
 
 	vfi_dev = makedev(vfi->dev_maj, vfi->dev_min);
 
-	if (is_memfd(vfi_dev)) {
-		char tmp[PATH_MAX];
-		strlcpy(tmp, fname, PATH_MAX);
-		strip_deleted(tmp, strlen(tmp));
-
-		/*
-		 * The error EPERM will be shown in the following pr_perror().
-		 * It comes from the previous open() call.
-		 */
-		pr_perror("Can't open mapped [%s]", tmp);
-
-		/*
-		 * TODO Perhaps we could do better than failing and dump the
-		 * memory like what is being done in shmem.c
-		 */
-		return -1;
-	}
-
 	if (is_hugetlb_dev(vfi_dev, &hugetlb_flag) || is_anon_shmem_map(vfi_dev)) {
+		vma->e->status |= VMA_AREA_REGULAR;
 		if (!(vma->e->flags & MAP_SHARED))
 			vma->e->status |= VMA_ANON_PRIVATE;
 		else
@@ -359,18 +342,44 @@ static int vma_get_mapfile_user(const char *fname, struct vma_area *vma, struct 
 	}
 
 	if (vma_stat(vma, fd)) {
-		close(fd);
-		return -1;
+		goto closefd;
 	}
 
-	if (vma->vmst->st_dev != vfi_dev || vma->vmst->st_ino != vfi->ino) {
-		pr_err("Failed to resolve mapping %lx filename\n", (unsigned long)vma->e->start);
-		close(fd);
-		return -1;
+	if (vma->vmst->st_ino != vfi->ino) {
+		goto errmsg;
+	}
+
+	/*
+	 * If devices don't match it could be because file is on a btrfs subvolume,
+	 * which means that device number returned by stat will not match what is
+	 * seen in smaps and other places. To deal with that we need a more involved
+	 * check.
+	 */
+	if (vma->vmst->st_dev != vfi_dev) {
+		int mnt_id;
+		struct ns_id *ns;
+
+		if (get_fd_mntid(fd, &mnt_id))
+			goto errmsg;
+
+		ns = lookup_nsid_by_mnt_id(mnt_id);
+		if (!ns)
+			goto errmsg;
+
+		if (!phys_stat_dev_match(vma->vmst->st_dev, vfi_dev, ns, fname))
+			goto errmsg;
+
+		vma->mnt_id = mnt_id;
 	}
 
 	*vm_file_fd = fd;
 	return 0;
+
+errmsg:
+	pr_err("Failed to resolve mapping %lx filename\n", (unsigned long)vma->e->start);
+closefd:
+	close(fd);
+	return -1;
 }
 
 static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, struct vma_file_info *vfi,
@@ -620,17 +629,16 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			pr_info("path: %s\n", file_path);
 			vma_area->e->status |= VMA_AREA_SYSVIPC;
 		} else {
-			/* Dump shmem dev, hugetlb dev (private and share) mappings the same way as memfd
-			 * when possible.
+			/* We dump memfd backed mapping, both normal and hugepage anonymous share
+			 * mapping using memfd approach when possible.
 			 */
 			if (is_memfd(st_buf->st_dev) || is_anon_shmem_map(st_buf->st_dev) ||
-			    (kdat.has_memfd_hugetlb && is_hugetlb_dev(st_buf->st_dev, &hugetlb_flag))) {
+			    can_dump_with_memfd_hugetlb(st_buf->st_dev, &hugetlb_flag, file_path, vma_area)) {
 				vma_area->e->status |= VMA_AREA_MEMFD;
 				vma_area->e->flags |= hugetlb_flag;
 				if (fault_injected(FI_HUGE_ANON_SHMEM_ID))
 					vma_area->e->shmid += FI_HUGE_ANON_SHMEM_ID_BASE;
 			} else if (is_hugetlb_dev(st_buf->st_dev, &hugetlb_flag)) {
-				/* hugetlb mapping but memfd does not support HUGETLB */
 				vma_area->e->flags |= hugetlb_flag;
 				vma_area->e->flags |= MAP_ANONYMOUS;
 
@@ -833,6 +841,7 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 			goto err;
 		}
 
+		pr_debug("Handling VMA with the following smaps entry: %s\n", str);
 		if (handle_vma(pid, vma_area, str + path_off, map_files_dir, &vfi, &prev_vfi, &vm_file_fd))
 			goto err;
 
@@ -891,7 +900,7 @@ int parse_pid_stat(pid_t pid, struct proc_pid_stat *s)
 	*tok = '\0';
 	*p = '\0';
 
-	strlcpy(s->comm, tok + 1, sizeof(s->comm));
+	__strlcpy(s->comm, tok + 1, sizeof(s->comm));
 
 	n = sscanf(p + 1,
 		   " %c %d %d %d %d %d %u %lu %lu %lu %lu "
@@ -1028,6 +1037,7 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 
 	cr->s.sigpnd = 0;
 	cr->s.shdpnd = 0;
+	cr->s.sigblk = 0;
 	cr->s.seccomp_mode = SECCOMP_MODE_DISABLED;
 
 	if (bfdopenr(&f))
@@ -1149,10 +1159,20 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 			done++;
 			continue;
 		}
+		if (!strncmp(str, "SigBlk:", 7)) {
+			unsigned long long sigblk = 0;
+
+			if (sscanf(str + 7, "%llx", &sigblk) != 1)
+				goto err_parse;
+			cr->s.sigblk |= sigblk;
+
+			done++;
+			continue;
+		}
 	}
 
 	/* seccomp and nspids are optional */
-	expected_done = (parsed_seccomp ? 11 : 10);
+	expected_done = (parsed_seccomp ? 12 : 11);
 	if (kdat.has_nspid)
 		expected_done++;
 	if (done == expected_done)
@@ -1954,10 +1974,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				     " pos:%lli ino:%lx sdev:%x",
 				     &e->tfd, &e->events, (long long *)&e->data, (long long *)&e->pos,
 				     (long *)&e->inode, &e->dev);
-			if (ret < 3 || ret > 6) {
-				eventpoll_tfd_entry__free_unpacked(e, NULL);
-				goto parse_err;
-			} else if (ret == 3) {
+			if (ret == 3) {
 				e->has_dev = false;
 				e->has_inode = false;
 				e->has_pos = false;
@@ -1965,7 +1982,7 @@ static int parse_fdinfo_pid_s(int pid, int fd, int type, void *arg)
 				e->has_dev = true;
 				e->has_inode = true;
 				e->has_pos = true;
-			} else if (ret < 6) {
+			} else {
 				eventpoll_tfd_entry__free_unpacked(e, NULL);
 				goto parse_err;
 			}
@@ -2541,7 +2558,8 @@ err:
 	return -1;
 }
 
-int parse_task_cgroup(int pid, struct parasite_dump_cgroup_args *args, struct list_head *retl, unsigned int *n)
+int parse_thread_cgroup(int pid, int tid, struct parasite_dump_cgroup_args *args, struct list_head *retl,
+			unsigned int *n)
 {
 	FILE *f;
 	int ret;
@@ -2549,7 +2567,7 @@ int parse_task_cgroup(int pid, struct parasite_dump_cgroup_args *args, struct li
 	unsigned int n_internal = 0;
 	struct cg_ctl *intern, *ext;
 
-	f = fopen_proc(pid, "cgroup");
+	f = fopen_proc(pid, "task/%d/cgroup", tid);
 	if (!f)
 		return -1;
 

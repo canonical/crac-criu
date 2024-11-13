@@ -51,6 +51,9 @@
 #include "images/netdev.pb-c.h"
 #include "images/inventory.pb-c.h"
 
+#undef LOG_PREFIX
+#define LOG_PREFIX "net: "
+
 #ifndef IFLA_NEW_IFINDEX
 #define IFLA_NEW_IFINDEX 49
 #endif
@@ -108,15 +111,18 @@ int read_ns_sys_file(char *path, char *buf, int len)
 	}
 
 	rlen = read(fd, buf, len);
+	if (rlen == -1)
+		pr_perror("Can't read ns' %s", path);
 	close(fd);
 
 	if (rlen == len) {
+		buf[0] = '\0';
 		pr_err("Too small buffer to read ns sys file %s\n", path);
 		return -1;
 	}
 
-	if (rlen > 0)
-		buf[rlen - 1] = '\0';
+	if (rlen >= 0)
+		buf[rlen] = '\0';
 
 	return rlen;
 }
@@ -1401,7 +1407,7 @@ static int move_veth(const char *netdev, struct ns_id *ns, struct net_link *link
 	len_val = strlen(netdev);
 	if (len_val >= IFNAMSIZ)
 		return -1;
-	strlcpy(mvreq.ifnam, netdev, IFNAMSIZ);
+	__strlcpy(mvreq.ifnam, netdev, IFNAMSIZ);
 
 	ret = userns_call(move_veth_cb, 0, &mvreq, sizeof(mvreq), ns->net.ns_fd);
 	if (ret < 0)
@@ -1531,7 +1537,7 @@ static int changeflags(int s, char *name, short flags)
 {
 	struct ifreq ifr;
 
-	strlcpy(ifr.ifr_name, name, IFNAMSIZ);
+	__strlcpy(ifr.ifr_name, name, IFNAMSIZ);
 	ifr.ifr_flags = flags;
 
 	if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) {
@@ -2042,10 +2048,10 @@ static inline int dump_iptables(struct cr_imgset *fds)
 	 * and iptables backend is nft to prevent duplicate dumps.
 	 */
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
-	iptables_cmd = get_legacy_iptables_bin(false);
+	iptables_cmd = get_legacy_iptables_bin(false, false);
 
 	if (kdat.ipv6)
-		ip6tables_cmd = get_legacy_iptables_bin(true);
+		ip6tables_cmd = get_legacy_iptables_bin(true, false);
 #endif
 
 	if (!iptables_cmd) {
@@ -2363,8 +2369,18 @@ static int prepare_xtable_lock(void)
 
 static inline int restore_iptables(int pid)
 {
+	char *iptables_cmd = "iptables-restore";
+	char *ip6tables_cmd = "ip6tables-restore";
+	char comm[32];
 	int ret = -1;
 	struct cr_img *img;
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	iptables_cmd = get_legacy_iptables_bin(false, true);
+
+	if (kdat.ipv6)
+		ip6tables_cmd = get_legacy_iptables_bin(true, true);
+#endif
 
 	img = open_image(CR_FD_IPTABLES, O_RSTR, pid);
 	if (img == NULL)
@@ -2375,7 +2391,19 @@ static inline int restore_iptables(int pid)
 		goto ipt6;
 	}
 
-	ret = run_iptables_tool("iptables-restore -w", img_raw_fd(img), -1);
+	if (!iptables_cmd) {
+		pr_err("Can't restore iptables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", iptables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", iptables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 	close_image(img);
 	if (ret)
 		return ret;
@@ -2386,7 +2414,19 @@ ipt6:
 	if (empty_image(img))
 		goto out;
 
-	ret = run_iptables_tool("ip6tables-restore -w", img_raw_fd(img), -1);
+	if (!ip6tables_cmd) {
+		pr_err("Can't restore ip6tables dump - no legacy version present\n");
+		close_image(img);
+		return -1;
+	}
+
+	if (snprintf(comm, sizeof(comm), "%s -w", ip6tables_cmd) >= sizeof(comm)) {
+		pr_err("Can't fit '%s -w' to buffer\n", ip6tables_cmd);
+		close_image(img);
+		return -1;
+	}
+
+	ret = run_iptables_tool(comm, img_raw_fd(img), -1);
 out:
 	close_image(img);
 
@@ -2394,29 +2434,18 @@ out:
 }
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
-static inline int restore_nftables(int pid)
+static inline int do_restore_nftables(struct cr_img *img)
 {
-	int ret = -1;
-	struct cr_img *img;
+	int exit_code = -1;
 	struct nft_ctx *nft;
 	off_t img_data_size;
 	char *buf;
 
-	img = open_image(CR_FD_NFTABLES, O_RSTR, pid);
-	if (img == NULL)
-		return -1;
-	if (empty_image(img)) {
-		/* Backward compatibility */
-		pr_info("Skipping nft restore, no image\n");
-		ret = 0;
-		goto image_close_out;
-	}
-
 	if ((img_data_size = img_raw_size(img)) < 0)
-		goto image_close_out;
+		goto out;
 
 	if (read_img_str(img, &buf, img_data_size) < 0)
-		goto image_close_out;
+		goto out;
 
 	nft = nft_ctx_new(NFT_CTX_DEFAULT);
 	if (!nft)
@@ -2434,18 +2463,44 @@ static inline int restore_nftables(int pid)
 #endif
 		goto nft_ctx_free_out;
 
-	ret = 0;
+	exit_code = 0;
 
 nft_ctx_free_out:
 	nft_ctx_free(nft);
 buf_free_out:
 	xfree(buf);
+out:
+	return exit_code;
+}
+#endif
+
+static inline int restore_nftables(int pid)
+{
+	int exit_code = -1;
+	struct cr_img *img;
+
+	img = open_image(CR_FD_NFTABLES, O_RSTR, pid);
+	if (img == NULL)
+		return -1;
+	if (empty_image(img)) {
+		/* Backward compatibility */
+		pr_info("Skipping nft restore, no image\n");
+		exit_code = 0;
+		goto image_close_out;
+	}
+
+#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
+	if (!do_restore_nftables(img))
+		exit_code = 0;
+#else
+	pr_err("Unable to restore nftables. CRIU was built without libnftables support\n");
+#endif
+
 image_close_out:
 	close_image(img);
 
-	return ret;
+	return exit_code;
 }
-#endif
 
 int read_net_ns_img(void)
 {
@@ -2774,10 +2829,8 @@ static int prepare_net_ns_second_stage(struct ns_id *ns)
 			ret = restore_rule(nsid);
 		if (!ret)
 			ret = restore_iptables(nsid);
-#if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 		if (!ret)
 			ret = restore_nftables(nsid);
-#endif
 	}
 
 	if (!ret)
@@ -3084,6 +3137,9 @@ int network_lock_internal(void)
 {
 	int ret = 0, nsret;
 
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
+
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
 
@@ -3145,6 +3201,9 @@ static int iptables_network_unlock_internal(void)
 static int network_unlock_internal(void)
 {
 	int ret = 0, nsret;
+
+	if (opts.network_lock_method == NETWORK_LOCK_SKIP)
+		return 0;
 
 	if (switch_ns(root_item->pid->real, &net_ns_desc, &nsret))
 		return -1;
@@ -3218,7 +3277,7 @@ int macvlan_ext_add(struct external *ext)
 /*
  * The setns() syscall (called by switch_ns()) can be extremely
  * slow. If we call it two or more times from the same task the
- * kernel will synchonously go on a very slow routine called
+ * kernel will synchronously go on a very slow routine called
  * synchronize_rcu() trying to put a reference on old namespaces.
  *
  * To avoid doing this more than once we pre-create all the
@@ -3369,7 +3428,7 @@ int collect_net_namespaces(bool for_dump)
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");
 
-struct ns_id *net_get_root_ns()
+struct ns_id *net_get_root_ns(void)
 {
 	static struct ns_id *root_netns = NULL;
 
@@ -3386,7 +3445,7 @@ struct ns_id *net_get_root_ns()
 
 /*
  * socket_diag doesn't report unbound and unconnected sockets,
- * so we have to get their network namesapces explicitly
+ * so we have to get their network namespaces explicitly
  */
 struct ns_id *get_socket_ns(int lfd)
 {
@@ -3486,7 +3545,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 			ret = -1;
 			goto out;
 		}
-		strlcpy(ifr.ifr_name, br, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, br, IFNAMSIZ);
 		ret = ioctl(s, SIOCBRADDIF, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't add interface %s to bridge %s", out, br);
@@ -3498,7 +3557,7 @@ static int move_to_bridge(struct external *ext, void *arg)
 		 * $ ip link set dev <device> up
 		 */
 		ifr.ifr_ifindex = 0;
-		strlcpy(ifr.ifr_name, out, IFNAMSIZ);
+		__strlcpy(ifr.ifr_name, out, IFNAMSIZ);
 		ret = ioctl(s, SIOCGIFFLAGS, &ifr);
 		if (ret < 0) {
 			pr_perror("Can't get flags of interface %s", out);

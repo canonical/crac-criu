@@ -12,15 +12,17 @@
 #include <sys/sysmacros.h>
 #include <stdint.h>
 #include <sys/socket.h>
-#include <arpa/inet.h> /* for sockaddr_in and inet_ntoa() */
+#include <netinet/in.h>
 #include <sys/prctl.h>
 #include <sys/inotify.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <linux/membarrier.h>
 
 #if defined(CONFIG_HAS_NFTABLES_LIB_API_0) || defined(CONFIG_HAS_NFTABLES_LIB_API_1)
 #include <nftables/libnftables.h>
 #endif
+#include <sys/utsname.h>
 
 #include "common/config.h"
 #include "int.h"
@@ -51,12 +53,14 @@
 #include "sched.h"
 #include "memfd.h"
 #include "mount-v2.h"
+#include "util-caps.h"
 
 struct kerndat_s kdat = {};
+volatile int dummy_var;
 
 static int check_pagemap(void)
 {
-	int ret, fd;
+	int ret, fd, retry;
 	u64 pfn = 0;
 
 	fd = __open_proc(PROC_SELF, EPERM, O_RDONLY, "pagemap");
@@ -70,11 +74,25 @@ static int check_pagemap(void)
 		return -1;
 	}
 
-	/* Get the PFN of some present page. Stack is here, so try it :) */
-	ret = pread(fd, &pfn, sizeof(pfn), (((unsigned long)&ret) / page_size()) * sizeof(pfn));
-	if (ret != sizeof(pfn)) {
-		pr_perror("Can't read pagemap");
-		return -1;
+	retry = 3;
+	while (retry--) {
+		++dummy_var;
+		/* Get the PFN of a page likely to be present. */
+		ret = pread(fd, &pfn, sizeof(pfn), PAGE_PFN((uintptr_t)&dummy_var) * sizeof(pfn));
+		if (ret != sizeof(pfn)) {
+			pr_perror("Can't read pagemap");
+			close(fd);
+			return -1;
+		}
+		/* The page can be swapped out by the time the read occurs,
+		 * in which case the rest of the bits are a swap type + offset
+		 * (which could be zero even if not hidden).
+		 * Retry if this happens. */
+		if (pfn & PME_PRESENT)
+			break;
+		pr_warn("got non-present PFN %#lx for the dummy data page; %s\n", (unsigned long)pfn,
+			retry ? "retrying" : "giving up");
+		pfn = 0;
 	}
 
 	close(fd);
@@ -420,10 +438,6 @@ static int kerndat_get_dirty_track(void)
 	} else {
 	no_dt:
 		pr_info("Dirty tracking support is OFF\n");
-		if (opts.track_mem) {
-			pr_err("Tracking memory is not available\n");
-			return -1;
-		}
 	}
 
 	return 0;
@@ -467,8 +481,15 @@ static int get_last_cap(void)
 	struct sysctl_req req[] = {
 		{ "kernel/cap_last_cap", &kdat.last_cap, CTL_U32 },
 	};
+	int ret;
 
-	return sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
+	ret = sysctl_op(req, ARRAY_SIZE(req), CTL_READ, 0);
+	if (ret || kdat.last_cap < 32 * CR_CAP_SIZE)
+		return ret;
+
+	pr_err("Kernel reports more capabilities than this CRIU supports: %u > %u\n",
+	       kdat.last_cap, 32 * CR_CAP_SIZE - 1);
+	return -1;
 }
 
 static bool kerndat_has_memfd_create(void)
@@ -617,29 +638,52 @@ static int kerndat_iptables_has_xtlocks(void)
 	return 0;
 }
 
-int kerndat_tcp_repair(void)
-{
-	int sock, clnt = -1, yes = 1, exit_code = -1;
-	struct sockaddr_in addr;
-	socklen_t aux;
+/*
+ * Unfortunately in C htonl() is not constexpr and cannot be used in a static
+ * initialization below.
+ */
+#define constant_htonl(x) \
+	(__BYTE_ORDER == __BIG_ENDIAN ? (x) : \
+		(((x) & 0xff000000) >> 24) | (((x) & 0x00ff0000) >>  8) | \
+		(((x) & 0x0000ff00) <<  8) | (((x) & 0x000000ff) << 24))
 
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	inet_pton(AF_INET, "127.0.0.1", &(addr.sin_addr));
-	addr.sin_port = 0;
+static int kerndat_tcp_repair(void)
+{
+	static const struct sockaddr_in loopback_ip4 = {
+		.sin_family = AF_INET,
+		.sin_port = 0,
+		.sin_addr = { constant_htonl(INADDR_LOOPBACK) },
+	};
+	static const struct sockaddr_in6 loopback_ip6 = {
+		.sin6_family = AF_INET6,
+		.sin6_port = 0,
+		.sin6_addr = IN6ADDR_LOOPBACK_INIT,
+	};
+	int sock, clnt = -1, yes = 1, exit_code = -1;
+	const struct sockaddr *addr;
+	struct sockaddr_storage listener_addr;
+	socklen_t addrlen;
+
+	addr = (const struct sockaddr *)&loopback_ip4;
+	addrlen = sizeof(loopback_ip4);
 	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0 && errno == EAFNOSUPPORT) {
+		addr = (const struct sockaddr *)&loopback_ip6;
+		addrlen = sizeof(loopback_ip6);
+		sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	}
 	if (sock < 0) {
 		pr_perror("Unable to create a socket");
 		return -1;
 	}
 
-	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr))) {
+	if (bind(sock, addr, addrlen)) {
 		pr_perror("Unable to bind a socket");
 		goto err;
 	}
 
-	aux = sizeof(addr);
-	if (getsockname(sock, (struct sockaddr *)&addr, &aux)) {
+	addrlen = sizeof(listener_addr);
+	if (getsockname(sock, (struct sockaddr *)&listener_addr, &addrlen)) {
 		pr_perror("Unable to get a socket name");
 		goto err;
 	}
@@ -649,13 +693,13 @@ int kerndat_tcp_repair(void)
 		goto err;
 	}
 
-	clnt = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	clnt = socket(addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
 	if (clnt < 0) {
 		pr_perror("Unable to create a socket");
 		goto err;
 	}
 
-	if (connect(clnt, (struct sockaddr *)&addr, sizeof(addr))) {
+	if (connect(clnt, (const struct sockaddr *)&listener_addr, addrlen)) {
 		pr_perror("Unable to connect a socket");
 		goto err;
 	}
@@ -682,20 +726,22 @@ err:
 	return exit_code;
 }
 
-int kerndat_nsid(void)
+static int kerndat_nsid(void)
 {
 	int nsid, sk;
 
+	kdat.has_nsid = false;
+
 	sk = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (sk < 0) {
-		pr_perror("Unable to create a netlink socket");
-		return -1;
+		pr_pwarn("Unable to create a netlink socket: NSID can't be used.");
+		return 0;
 	}
 
 	if (net_get_nsid(sk, getpid(), &nsid) < 0) {
-		pr_err("NSID is not supported\n");
+		pr_warn("NSID is not supported\n");
 		close(sk);
-		return -1;
+		return 0;
 	}
 
 	kdat.has_nsid = true;
@@ -933,6 +979,7 @@ static int kerndat_has_ptrace_get_rseq_conf(void)
 	pid_t pid;
 	int len;
 	struct __ptrace_rseq_configuration rseq;
+	int ret = 0;
 
 	pid = fork_and_ptrace_attach(NULL);
 	if (pid < 0) {
@@ -943,6 +990,9 @@ static int kerndat_has_ptrace_get_rseq_conf(void)
 
 	len = ptrace(PTRACE_GET_RSEQ_CONFIGURATION, pid, sizeof(rseq), &rseq);
 	if (len != sizeof(rseq)) {
+		if (kdat.has_ptrace_get_rseq_conf)
+			ret = 1; /* we should update kdat */
+
 		kdat.has_ptrace_get_rseq_conf = false;
 		pr_info("ptrace(PTRACE_GET_RSEQ_CONFIGURATION) is not supported\n");
 		goto out;
@@ -953,16 +1003,27 @@ static int kerndat_has_ptrace_get_rseq_conf(void)
 	 * we need to pay attention to that and, possibly, make changes on the CRIU side.
 	 */
 	if (rseq.flags != 0) {
+		if (kdat.has_ptrace_get_rseq_conf)
+			ret = 1; /* we should update kdat */
+
 		kdat.has_ptrace_get_rseq_conf = false;
 		pr_err("ptrace(PTRACE_GET_RSEQ_CONFIGURATION): rseq.flags != 0\n");
 	} else {
+		if (!kdat.has_ptrace_get_rseq_conf)
+			ret = 1; /* we should update kdat */
+
 		kdat.has_ptrace_get_rseq_conf = true;
+
+		if (memcmp(&kdat.libc_rseq_conf, &rseq, sizeof(rseq)))
+			ret = 1; /* we should update kdat */
+
+		kdat.libc_rseq_conf = rseq;
 	}
 
 out:
 	kill(pid, SIGKILL);
 	waitpid(pid, NULL, 0);
-	return 0;
+	return ret;
 }
 
 int kerndat_sockopt_buf_lock(void)
@@ -973,6 +1034,8 @@ int kerndat_sockopt_buf_lock(void)
 	int sock;
 
 	sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (sock < 0 && errno == EAFNOSUPPORT)
+		sock = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
 	if (sock < 0) {
 		pr_perror("Unable to create a socket");
 		return -1;
@@ -1052,9 +1115,9 @@ static int kerndat_has_move_mount_set_group(void)
 	exit_code = 0;
 out:
 	if (umount2(tmpdir, MNT_DETACH))
-		pr_warn("Fail to umount2 %s: %m\n", tmpdir);
+		pr_warn("Fail to umount2 %s: %s\n", tmpdir, strerror(errno));
 	if (rmdir(tmpdir))
-		pr_warn("Fail to rmdir %s: %m\n", tmpdir);
+		pr_warn("Fail to rmdir %s: %s\n", tmpdir, strerror(errno));
 	return exit_code;
 }
 
@@ -1074,19 +1137,66 @@ static int kerndat_has_openat2(void)
 	return 0;
 }
 
-#define KERNDAT_CACHE_FILE     KDAT_RUNDIR "/criu.kdat"
-#define KERNDAT_CACHE_FILE_TMP KDAT_RUNDIR "/.criu.kdat"
+#define KERNDAT_CACHE_NAME "criu.kdat"
+#define KERNDAT_CACHE_FILE KDAT_RUNDIR "/" KERNDAT_CACHE_NAME
 
+/*
+ * Returns:
+ * -1 if kdat_file was not written due to error
+ * 0 if kdat_file was written
+ * 1 if kdat_file was not written because cache directory undefined in env (non-root mode)
+ */
+static int get_kerndat_filename(char **kdat_file)
+{
+	int ret;
+
+	/*
+	 * Running as non-root, even with CAP_CHECKPOINT_RESTORE, does not
+	 * allow to write to KDAT_RUNDIR which usually is only writable by root.
+	 * Let's write criu.kdat file to XDG_RUNTIME_DIR for non-root cases.
+	 * Note that XDG_RUNTIME_DIR is not always defined (e.g. when executing
+	 * via su/sudo).
+	 */
+	if (opts.unprivileged) {
+		const char *cache_dir = getenv("XDG_RUNTIME_DIR");
+		if (!cache_dir) {
+			pr_warn("$XDG_RUNTIME_DIR not set. Cannot find location for kerndat file\n");
+			return 1;
+		}
+		ret = asprintf(kdat_file, "%s/%s", cache_dir, KERNDAT_CACHE_NAME);
+	} else {
+		ret = asprintf(kdat_file, "%s", KERNDAT_CACHE_FILE);
+	}
+
+	if (unlikely(ret < 0)) {
+		pr_warn("Cannot allocate memory for kerndat file name\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Returns:
+ * -1 if error
+ * 0 if cache was loaded
+ * 1 if cache does not exist or is stale or cache directory undefined in env (non-root mode)
+ */
 static int kerndat_try_load_cache(void)
 {
+	cleanup_free char *kdat_file = NULL;
 	int fd, ret;
 
-	fd = open(KERNDAT_CACHE_FILE, O_RDONLY);
+	ret = get_kerndat_filename(&kdat_file);
+	if (ret)
+		return ret;
+
+	fd = open(kdat_file, O_RDONLY);
 	if (fd < 0) {
 		if (ENOENT == errno)
-			pr_debug("File %s does not exist\n", KERNDAT_CACHE_FILE);
+			pr_debug("File %s does not exist\n", kdat_file);
 		else
-			pr_warn("Can't load %s\n", KERNDAT_CACHE_FILE);
+			pr_warn("Can't load %s\n", kdat_file);
 		return 1;
 	}
 
@@ -1100,12 +1210,12 @@ static int kerndat_try_load_cache(void)
 	close(fd);
 
 	if (ret != sizeof(kdat) || kdat.magic1 != KDAT_MAGIC || kdat.magic2 != KDAT_MAGIC_2) {
-		pr_warn("Stale %s file\n", KERNDAT_CACHE_FILE);
-		unlink(KERNDAT_CACHE_FILE);
+		pr_warn("Stale %s file\n", kdat_file);
+		unlink(kdat_file);
 		return 1;
 	}
 
-	pr_info("Loaded kdat cache from %s\n", KERNDAT_CACHE_FILE);
+	pr_info("Loaded kdat cache from %s\n", kdat_file);
 	return 0;
 }
 
@@ -1113,11 +1223,23 @@ static void kerndat_save_cache(void)
 {
 	int fd, ret;
 	struct statfs s;
+	cleanup_free char *kdat_file = NULL;
+	cleanup_free char *kdat_file_tmp = NULL;
 
 	pr_debug("skip kerndat_save_cache\n");
 	return;
 
-	fd = open(KERNDAT_CACHE_FILE_TMP, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	if (get_kerndat_filename(&kdat_file))
+		return;
+
+	ret = asprintf(&kdat_file_tmp, "%s.tmp", kdat_file);
+
+	if (unlikely(ret < 0)) {
+		pr_warn("Cannot allocate memory for kerndat file name\n");
+		return;
+	}
+
+	fd = open(kdat_file_tmp, O_CREAT | O_EXCL | O_WRONLY, 0600);
 	if (fd < 0)
 		/*
 		 * It can happen that we race with some other criu
@@ -1126,6 +1248,10 @@ static void kerndat_save_cache(void)
 		 */
 		return;
 
+	/*
+	 * If running as root we store the cache file on a tmpfs (/run),
+	 * because the file should be gone after reboot.
+	 */
 	if (fstatfs(fd, &s) < 0 || s.f_type != TMPFS_MAGIC) {
 		pr_warn("Can't keep kdat cache on non-tempfs\n");
 		close(fd);
@@ -1139,26 +1265,35 @@ static void kerndat_save_cache(void)
 	 */
 	kdat.magic1 = KDAT_MAGIC;
 	kdat.magic2 = KDAT_MAGIC_2;
+
 	ret = write(fd, &kdat, sizeof(kdat));
 	close(fd);
 
 	if (ret == sizeof(kdat))
-		ret = rename(KERNDAT_CACHE_FILE_TMP, KERNDAT_CACHE_FILE);
+		ret = rename(kdat_file_tmp, kdat_file);
 	else {
 		ret = -1;
 		errno = EIO;
 	}
 
 	if (ret < 0) {
-		pr_perror("Couldn't save %s", KERNDAT_CACHE_FILE);
+		pr_perror("Couldn't save %s", kdat_file);
 	unl:
-		unlink(KERNDAT_CACHE_FILE_TMP);
+		unlink(kdat_file);
 	}
 }
 
 static int kerndat_uffd(void)
 {
 	int uffd, err = 0;
+
+	if (opts.unprivileged)
+		/*
+		 * If running as non-root uffd_open() fails with
+		 * 'Operation not permitted'. Just ignore uffd for
+		 * non-root for now.
+		 */
+		return 0;
 
 	kdat.uffd_features = 0;
 	uffd = uffd_open(0, &kdat.uffd_features, &err);
@@ -1252,6 +1387,8 @@ int kerndat_has_thp_disable(void)
 
 			parse_vmflags(str, &flags, &madv, &io_pf);
 			kdat.has_thp_disable = !(madv & (1 << MADV_NOHUGEPAGE));
+			if (!kdat.has_thp_disable)
+				pr_warn("prctl PR_SET_THP_DISABLE sets MADV_NOHUGEPAGE\n");
 			break;
 		}
 	}
@@ -1295,16 +1432,21 @@ static bool kerndat_has_clone3_set_tid(void)
 	 */
 	pid = syscall(__NR_clone3, &args, sizeof(args));
 
-	if (pid == -1 && (errno == ENOSYS || errno == E2BIG)) {
-		kdat.has_clone3_set_tid = false;
-		return 0;
-	}
-	if (pid == -1 && errno == EINVAL) {
-		kdat.has_clone3_set_tid = true;
-	} else if (pid == -1 && errno != EPERM) {
-		pr_perror("Unexpected error from clone3");
+	if (pid != -1) {
+		pr_err("Unexpected success: clone3() returned %d\n", pid);
 		return -1;
 	}
+
+	if (errno == ENOSYS || errno == E2BIG)
+		return 0;
+
+	if (errno != EINVAL) {
+		pr_pwarn("Unexpected error from clone3");
+		return 0;
+	}
+
+        if (errno != EPERM)
+		kdat.has_clone3_set_tid = true;
 
 	return 0;
 }
@@ -1469,6 +1611,65 @@ static int kerndat_has_nftables_concat(void)
 #endif
 }
 
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78
+#endif
+
+static int __kerndat_has_ipv6_freebind(int sk)
+{
+	int val = 1;
+
+	if (setsockopt(sk, SOL_IPV6, IPV6_FREEBIND, &val, sizeof(int)) == -1) {
+		if (errno == ENOPROTOOPT) {
+			kdat.has_ipv6_freebind = false;
+			return 0;
+		}
+		pr_perror("Unable to setsockopt ipv6_freebind");
+		return -1;
+	}
+
+	kdat.has_ipv6_freebind = true;
+	return 0;
+}
+
+static int kerndat_has_ipv6_freebind(void)
+{
+	int sk, ret;
+
+	if (!kdat.ipv6) {
+		kdat.has_ipv6_freebind = false;
+		return 0;
+	}
+
+	sk = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if (sk == -1) {
+		pr_perror("Unable to create a ipv6 dgram socket");
+		return -1;
+	}
+
+	ret = __kerndat_has_ipv6_freebind(sk);
+	close(sk);
+	return ret;
+}
+
+#define MEMBARRIER_CMDBIT_GET_REGISTRATIONS 9
+
+static int kerndat_has_membarrier_get_registrations(void)
+{
+	int ret = syscall(__NR_membarrier, 1 << MEMBARRIER_CMDBIT_GET_REGISTRATIONS, 0);
+	if (ret < 0) {
+		if (errno != EINVAL) {
+			return ret;
+		}
+
+		kdat.has_membarrier_get_registrations = false;
+	} else {
+		kdat.has_membarrier_get_registrations = true;
+	}
+
+	return 0;
+}
+
 /*
  * Some features depend on resource that can be dynamically changed
  * at the OS runtime. There are cases that we cannot determine the
@@ -1489,10 +1690,55 @@ int kerndat_try_load_new(void)
 	if (ret < 0)
 		return ret;
 
+	ret = kerndat_has_ptrace_get_rseq_conf();
+	if (ret < 0) {
+		pr_err("kerndat_has_ptrace_get_rseq_conf failed when initializing kerndat.\n");
+		return ret;
+	}
+
 	/* New information is found, we need to save to the cache */
 	if (ret)
 		kerndat_save_cache();
 	return 0;
+}
+
+static int root_only_init(void)
+{
+	int ret = 0;
+
+	if (opts.unprivileged)
+		return 0;
+
+	if (!ret && kerndat_loginuid()) {
+		pr_err("kerndat_loginuid failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_tun_netns()) {
+		pr_err("kerndat_tun_netns failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_socket_unix_file()) {
+		pr_err("kerndat_socket_unix_file failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_link_nsid()) {
+		pr_err("kerndat_link_nsid failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_socket_netns()) {
+		pr_err("kerndat_socket_netns failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_nftables_concat()) {
+		pr_err("kerndat_has_nftables_concat failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_move_mount_set_group()) {
+		pr_err("kerndat_has_move_mount_set_group failed when initializing kerndat.\n");
+		ret = -1;
+	}
+
+	return ret;
 }
 
 int kerndat_init(void)
@@ -1512,7 +1758,16 @@ int kerndat_init(void)
 	memset(&kdat, 0, sizeof(kdat));
 
 	preload_socket_modules();
-	preload_netfilter_modules();
+	if (!opts.unprivileged)
+		/*
+		 * This uses 'iptables -L' to implicitly load necessary modules.
+		 * If the non nft backed iptables is used it does a
+		 * openat(AT_FDCWD, "/run/xtables.lock", O_RDONLY|O_CREAT, 0600) = -1 EACCES
+		 * which will fail as non-root. There are no capabilities to
+		 * change this. The iptables nft backend fails with
+		 * openat(AT_FDCWD, "/proc/net/ip_tables_names", O_RDONLY) = -1 EACCES
+		 */
+		preload_netfilter_modules();
 
 	if (check_pagemap()) {
 		pr_err("check_pagemap failed when initializing kerndat.\n");
@@ -1550,10 +1805,14 @@ int kerndat_init(void)
 		pr_err("get_ipv6 failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_loginuid()) {
-		pr_err("kerndat_loginuid failed when initializing kerndat.\n");
+	if (!ret && kerndat_nsid()) {
+		pr_err("kerndat_nsid failed when initializing kerndat.\n");
 		ret = -1;
 	}
+
+	if (!ret && root_only_init())
+		ret = -1;
+
 	if (!ret && kerndat_iptables_has_xtlocks()) {
 		pr_err("kerndat_iptables_has_xtlocks failed when initializing kerndat.\n");
 		ret = -1;
@@ -1564,22 +1823,6 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_compat_restore()) {
 		pr_err("kerndat_compat_restore failed when initializing kerndat.\n");
-		ret = -1;
-	}
-	if (!ret && kerndat_tun_netns()) {
-		pr_err("kerndat_tun_netns failed when initializing kerndat.\n");
-		ret = -1;
-	}
-	if (!ret && kerndat_socket_unix_file()) {
-		pr_err("kerndat_socket_unix_file failed when initializing kerndat.\n");
-		ret = -1;
-	}
-	if (!ret && kerndat_nsid()) {
-		pr_err("kerndat_nsid failed when initializing kerndat.\n");
-		ret = -1;
-	}
-	if (!ret && kerndat_link_nsid()) {
-		pr_err("kerndat_link_nsid failed when initializing kerndat.\n");
 		ret = -1;
 	}
 	if (!ret && kerndat_has_memfd_create()) {
@@ -1612,10 +1855,6 @@ int kerndat_init(void)
 		pr_err("kerndat_vdso_preserves_hint failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_socket_netns()) {
-		pr_err("kerndat_socket_netns failed when initializing kerndat.\n");
-		ret = -1;
-	}
 	if (!ret && kerndat_x86_has_ptrace_fpu_xsave_bug()) {
 		pr_err("kerndat_x86_has_ptrace_fpu_xsave_bug failed when initializing kerndat.\n");
 		ret = -1;
@@ -1640,7 +1879,7 @@ int kerndat_init(void)
 		pr_err("has_time_namespace failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_has_newifindex()) {
+	if (!ret && (!opts.unprivileged || has_cap_net_admin(opts.cap_eff)) && kerndat_has_newifindex()) {
 		pr_err("kerndat_has_newifindex failed when initializing kerndat.\n");
 		ret = -1;
 	}
@@ -1654,16 +1893,8 @@ int kerndat_init(void)
 		pr_err("kerndat_has_nspid failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_has_nftables_concat()) {
-		pr_err("kerndat_has_nftables_concat failed when initializing kerndat.\n");
-		ret = -1;
-	}
 	if (!ret && kerndat_sockopt_buf_lock()) {
 		pr_err("kerndat_sockopt_buf_lock failed when initializing kerndat.\n");
-		ret = -1;
-	}
-	if (!ret && kerndat_has_move_mount_set_group()) {
-		pr_err("kerndat_has_move_mount_set_group failed when initializing kerndat.\n");
 		ret = -1;
 	}
 	if (!ret && kerndat_has_openat2()) {
@@ -1674,8 +1905,16 @@ int kerndat_init(void)
 		pr_err("kerndat_has_rseq failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_has_ptrace_get_rseq_conf()) {
+	if (!ret && (kerndat_has_ptrace_get_rseq_conf() < 0)) {
 		pr_err("kerndat_has_ptrace_get_rseq_conf failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && (kerndat_has_ipv6_freebind() < 0)) {
+		pr_err("kerndat_has_ipv6_freebind failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_membarrier_get_registrations()) {
+		pr_err("kerndat_has_membarrier_get_registrations failed when initializing kerndat.\n");
 		ret = -1;
 	}
 

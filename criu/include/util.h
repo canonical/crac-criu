@@ -263,6 +263,10 @@ bool is_path_prefix(const char *path, const char *prefix);
 FILE *fopenat(int dirfd, char *path, char *cflags);
 void split(char *str, char token, char ***out, int *n);
 
+int cr_fchown(int fd, uid_t new_uid, gid_t new_gid);
+int cr_fchperm(int fd, uid_t new_uid, gid_t new_gid, mode_t new_mode);
+int cr_fchpermat(int dirfd, const char *path, uid_t new_uid, gid_t new_gid, mode_t new_mode, int flags);
+
 int fd_has_data(int lfd);
 
 int make_yard(char *path);
@@ -274,8 +278,6 @@ static inline int sk_wait_data(int sk)
 }
 
 void fd_set_nonblocking(int fd, bool on);
-void tcp_nodelay(int sk, bool on);
-void tcp_cork(int sk, bool on);
 
 const char *ns_to_string(unsigned int ns);
 
@@ -384,7 +386,9 @@ static inline void print_stack_trace(pid_t pid)
 
 extern int mount_detached_fs(const char *fsname);
 
-extern char *get_legacy_iptables_bin(bool ipv6);
+extern char *get_legacy_iptables_bin(bool ipv6, bool restore);
+
+extern int set_opts_cap_eff(void);
 
 extern ssize_t read_all(int fd, void *buf, size_t size);
 extern ssize_t write_all(int fd, const void *buf, size_t size);

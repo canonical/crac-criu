@@ -357,6 +357,10 @@ static int root_prepare_shared(void)
 	if (ret)
 		goto err;
 
+	ret = add_fake_unix_queuers();
+	if (ret)
+		goto err;
+
 	/*
 	 * This should be called with all packets collected AND all
 	 * fdescs and fles prepared BUT post-prep-s not run.
@@ -370,10 +374,6 @@ static int root_prepare_shared(void)
 		goto err;
 
 	ret = unix_prepare_root_shared();
-	if (ret)
-		goto err;
-
-	ret = add_fake_unix_queuers();
 	if (ret)
 		goto err;
 
@@ -868,6 +868,9 @@ static int prepare_proc_misc(pid_t pid, TaskCoreEntry *tc, struct task_restore_a
 	if (tc->has_child_subreaper)
 		args->child_subreaper = tc->child_subreaper;
 
+	if (tc->has_membarrier_registration_mask)
+		args->membarrier_registration_mask = tc->membarrier_registration_mask;
+
 	/* loginuid value is critical to restore */
 	if (kdat.luid == LUID_FULL && tc->has_loginuid && tc->loginuid != INVALID_UID) {
 		ret = prepare_loginuid(tc->loginuid);
@@ -1359,7 +1362,22 @@ static inline int fork_with_pid(struct pstree_item *item)
 			return -1;
 
 		item->pid->state = ca.core->tc->task_state;
-		rsti(item)->cg_set = ca.core->tc->cg_set;
+
+		/*
+		 * Zombie tasks' cgroup is not dumped/restored.
+		 * cg_set == 0 is skipped in prepare_task_cgroup()
+		 */
+		if (item->pid->state == TASK_DEAD) {
+			rsti(item)->cg_set = 0;
+		} else {
+			if (ca.core->thread_core->has_cg_set)
+				rsti(item)->cg_set = ca.core->thread_core->cg_set;
+			else
+				rsti(item)->cg_set = ca.core->tc->cg_set;
+		}
+
+		if (ca.core->tc->has_stop_signo)
+			item->pid->stop_signo = ca.core->tc->stop_signo;
 
 		if (item->pid->state != TASK_DEAD && !task_alive(item)) {
 			pr_err("Unknown task state %d\n", item->pid->state);
@@ -1838,7 +1856,7 @@ static int restore_task_with_children(void *_arg)
 	}
 
 	if (log_init_by_pid(vpid(current)))
-		return -1;
+		goto err;
 
 	if (current->parent == NULL) {
 		/*
@@ -1865,8 +1883,18 @@ static int restore_task_with_children(void *_arg)
 				goto err;
 		}
 
+		if (set_opts_cap_eff())
+			goto err;
+
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
+			goto err;
+
+		/*
+		 * Since we don't support nesting of cgroup namespaces, let's
+		 * only set up the cgns (if it exists) in the init task.
+		 */
+		if (prepare_cgroup_namespace(current) < 0)
 			goto err;
 	}
 
@@ -1879,7 +1907,7 @@ static int restore_task_with_children(void *_arg)
 	 * we will only move the root one there, others will
 	 * just have it inherited.
 	 */
-	if (prepare_task_cgroup(current) < 0)
+	if (restore_task_cgroup(current) < 0)
 		goto err;
 
 	/* Restore root task */
@@ -2020,6 +2048,10 @@ static int attach_to_tasks(bool root_seized)
 				return -1;
 			}
 
+			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
+				return -1;
+			}
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -2084,7 +2116,7 @@ static int restore_rseq_cs(void)
 	return 0;
 }
 
-static int catch_tasks(bool root_seized, enum trace_flags *flag)
+static int catch_tasks(bool root_seized)
 {
 	struct pstree_item *item;
 
@@ -2114,31 +2146,13 @@ static int catch_tasks(bool root_seized, enum trace_flags *flag)
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, flag, fault_injected(FI_NO_BREAKPOINTS));
+			ret = compel_stop_pie(pid, rsti(item)->breakpoint, fault_injected(FI_NO_BREAKPOINTS));
 			if (ret < 0)
 				return -1;
 		}
 	}
 
 	return 0;
-}
-
-static int clear_breakpoints(void)
-{
-	struct pstree_item *item;
-	int ret = 0, i;
-
-	if (fault_injected(FI_NO_BREAKPOINTS))
-		return 0;
-
-	for_each_pstree_item(item) {
-		if (!task_alive(item))
-			continue;
-		for (i = 0; i < item->nr_threads; i++)
-			ret |= ptrace_flush_breakpoints(item->threads[i].real);
-	}
-
-	return ret;
 }
 
 static void finalize_restore(void)
@@ -2164,8 +2178,14 @@ static void finalize_restore(void)
 
 		xfree(ctl);
 
-		if ((item->pid->state == TASK_STOPPED) || (opts.final_state == TASK_STOPPED))
+		if (opts.final_state == TASK_STOPPED)
 			kill(item->pid->real, SIGSTOP);
+		else if (item->pid->state == TASK_STOPPED) {
+			if (item->pid->stop_signo > 0)
+				kill(item->pid->real, item->pid->stop_signo);
+			else
+				kill(item->pid->real, SIGSTOP);
+		}
 	}
 }
 
@@ -2275,7 +2295,7 @@ static void reap_zombies(void)
 
 static int restore_root_task(struct pstree_item *init)
 {
-	enum trace_flags flag = TRACE_ALL;
+	//enum trace_flags flag = TRACE_ALL;
 	int root_seized = 0;
 	bool ptrace_allowed = opts.ptrace_allowed;
 
@@ -2440,6 +2460,10 @@ skip_ns_bouncing:
 	if (ret < 0)
 		goto out_kill;
 
+	ret = stop_cgroupd();
+	if (ret < 0)
+		goto out_kill;
+
 	ret = move_veth_to_bridge();
 	if (ret < 0)
 		goto out_kill;
@@ -2494,9 +2518,10 @@ skip_ns_bouncing:
 		goto out_kill_network_unlocked;
 
 	timing_stop(TIME_RESTORE);
-	if (ptrace_allowed && catch_tasks(root_seized, &flag)) {
+	if (ptrace_allowed && catch_tasks(root_seized)) {
 		pr_warn("Can't catch all tasks, disabling ptrace\n");
 		ptrace_allowed = false;
+		goto out_kill_network_unlocked;
 	}
 
 	if (lazy_pages_finish_restore())
@@ -2505,14 +2530,11 @@ skip_ns_bouncing:
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
 	if (ptrace_allowed) {
-		ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1), flag);
+                ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 		if (ret) {
 			pr_err("Can't stop all tasks on rt_sigreturn\n");
 			goto out_kill_network_unlocked;
 		}
-
-		if (clear_breakpoints())
-			pr_err("Unable to flush breakpoints\n");
 
 		finalize_restore();
 	}
@@ -2999,12 +3021,6 @@ out:
 	return ret;
 }
 
-static inline int verify_cap_size(CredsEntry *ce)
-{
-	return ((ce->n_cap_inh == CR_CAP_SIZE) && (ce->n_cap_eff == CR_CAP_SIZE) && (ce->n_cap_prm == CR_CAP_SIZE) &&
-		(ce->n_cap_bnd == CR_CAP_SIZE));
-}
-
 static int prepare_mm(pid_t pid, struct task_restore_args *args)
 {
 	int exe_fd, i, ret = -1;
@@ -3030,7 +3046,7 @@ static int prepare_mm(pid_t pid, struct task_restore_args *args)
 
 	args->fd_exe_link = exe_fd;
 
-	args->has_thp_enabled = rsti(current)->has_thp_enabled;
+	args->thp_disabled = mm->has_thp_disabled && mm->thp_disabled;
 
 	ret = 0;
 out:
@@ -3163,9 +3179,16 @@ static void prep_libc_rseq_info(struct rst_rseq_param *rseq)
 		return;
 	}
 
-	rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
-	rseq->rseq_abi_size = __rseq_size;
-	rseq->signature = RSEQ_SIG;
+        if (!kdat.has_ptrace_get_rseq_conf) {
+                rseq->rseq_abi_pointer = encode_pointer(__criu_thread_pointer() + __rseq_offset);
+                rseq->rseq_abi_size = __rseq_size;
+                rseq->signature = RSEQ_SIG;
+                return;
+        }
+
+        rseq->rseq_abi_pointer = kdat.libc_rseq_conf.rseq_abi_pointer;
+        rseq->rseq_abi_size = kdat.libc_rseq_conf.rseq_abi_size;
+        rseq->signature = kdat.libc_rseq_conf.signature;
 }
 
 #elif defined(__GLIBC__)
@@ -3476,16 +3499,30 @@ static bool groups_match(gid_t *groups, int n_groups)
 	return ret;
 }
 
+static void copy_caps(u32 *out_caps, u32 *in_caps, int n_words)
+{
+	int i, cap_end;
+
+	for (i = kdat.last_cap + 1; i < 32 * n_words; ++i) {
+		if (~in_caps[i / 32] & (1 << (i % 32)))
+			continue;
+
+		pr_warn("Dropping unsupported capability %d > %d)\n", i, kdat.last_cap);
+		/* extra caps will be cleared below */
+	}
+
+	n_words = min(n_words, (kdat.last_cap + 31) / 32);
+	cap_end = (kdat.last_cap & 31) + 1;
+	memcpy(out_caps, in_caps, sizeof(*out_caps) * n_words);
+	if ((cap_end & 31) && n_words)
+		out_caps[n_words - 1] &= (1 << cap_end) - 1;
+	memset(out_caps + n_words, 0, sizeof(*out_caps) * (CR_CAP_SIZE - n_words));
+}
+
 static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned long *prev_pos)
 {
 	unsigned long this_pos;
 	struct thread_creds_args *args;
-
-	if (!verify_cap_size(ce)) {
-		pr_err("Caps size mismatch %d %d %d %d\n", (int)ce->n_cap_inh, (int)ce->n_cap_eff, (int)ce->n_cap_prm,
-		       (int)ce->n_cap_bnd);
-		return ERR_PTR(-EINVAL);
-	}
 
 	this_pos = rst_mem_align_cpos(RM_PRIVATE);
 
@@ -3522,7 +3559,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_profile = lsm_profile;
-			strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
+			__strlcpy(args->lsm_profile, rendered, lsm_profile_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3556,7 +3593,7 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 
 			args = rst_mem_remap_ptr(this_pos, RM_PRIVATE);
 			args->lsm_sockcreate = lsm_sockcreate;
-			strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
+			__strlcpy(args->lsm_sockcreate, rendered, lsm_sockcreate_len + 1);
 			xfree(rendered);
 		}
 	} else {
@@ -3574,10 +3611,10 @@ static struct thread_creds_args *rst_prep_creds_args(CredsEntry *ce, unsigned lo
 	args->creds.groups = NULL;
 	args->creds.lsm_profile = NULL;
 
-	memcpy(args->cap_inh, ce->cap_inh, sizeof(args->cap_inh));
-	memcpy(args->cap_eff, ce->cap_eff, sizeof(args->cap_eff));
-	memcpy(args->cap_prm, ce->cap_prm, sizeof(args->cap_prm));
-	memcpy(args->cap_bnd, ce->cap_bnd, sizeof(args->cap_bnd));
+	copy_caps(args->cap_inh, ce->cap_inh, ce->n_cap_inh);
+	copy_caps(args->cap_eff, ce->cap_eff, ce->n_cap_eff);
+	copy_caps(args->cap_prm, ce->cap_prm, ce->n_cap_prm);
+	copy_caps(args->cap_bnd, ce->cap_bnd, ce->n_cap_bnd);
 
 	if (ce->n_groups && !groups_match(ce->groups, ce->n_groups)) {
 		unsigned int *groups;
@@ -3890,6 +3927,10 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	prep_libc_rseq_info(&task_args->libc_rseq);
 
+	task_args->uid = opts.uid;
+	for (i = 0; i < CR_CAP_SIZE; i++)
+		task_args->cap_eff[i] = opts.cap_eff[i];
+
 	/*
 	 * Fill up per-thread data.
 	 */
@@ -3946,6 +3987,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		thread_args[i].gpregs = *CORE_THREAD_ARCH_INFO(tcore)->gpregs;
 		thread_args[i].clear_tid_addr = CORE_THREAD_ARCH_INFO(tcore)->clear_tid_addr;
 		core_get_tls(tcore, &thread_args[i].tls);
+
+		if (tcore->thread_core->has_cg_set && rsti(current)->cg_set != tcore->thread_core->cg_set) {
+			thread_args[i].cg_set = tcore->thread_core->cg_set;
+			thread_args[i].cgroupd_sk = dup(get_service_fd(CGROUPD_SK));
+		} else {
+			thread_args[i].cg_set = -1;
+		}
 
 		ret = prep_rseq(&thread_args[i].rseq, tcore->thread_core);
 		if (ret)
@@ -4043,6 +4091,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	close_service_fd(USERNSD_SK);
 	close_service_fd(FDSTORE_SK_OFF);
 	close_service_fd(RPC_SK_OFF);
+	close_service_fd(CGROUPD_SK);
 
 	__gcov_flush();
 

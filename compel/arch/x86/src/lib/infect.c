@@ -220,6 +220,16 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *sigframe, struct rt_sigfr
 #define get_signed_user_reg(pregs, name) \
 	((user_regs_native(pregs)) ? (int64_t)((pregs)->native.name) : (int32_t)((pregs)->compat.name))
 
+static int get_task_fpregs(pid_t pid, user_fpregs_struct_t *xsave)
+{
+	if (ptrace(PTRACE_GETFPREGS, pid, NULL, xsave)) {
+		pr_perror("Can't obtain FPU registers for %d", pid);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int get_task_xsave(pid_t pid, user_fpregs_struct_t *xsave)
 {
 	struct iovec iov;
@@ -232,17 +242,31 @@ static int get_task_xsave(pid_t pid, user_fpregs_struct_t *xsave)
 		return -1;
 	}
 
-	return 0;
-}
-
-static int get_task_fpregs(pid_t pid, user_fpregs_struct_t *xsave)
-{
-	if (ptrace(PTRACE_GETFPREGS, pid, NULL, xsave)) {
-		pr_perror("Can't obtain FPU registers for %d", pid);
-		return -1;
+	if ((xsave->xsave_hdr.xstate_bv & 3) != 3) {
+		// Due to init-optimisation [1] x87 FPU or SSE state may not be filled in.
+		// Since those are restored unconditionally, make sure the init values are
+		// filled by retrying with old PTRACE_GETFPREGS.
+		//
+		// [1] Intel® 64 and IA-32 Architectures Software Developer's
+		//     Manual Volume 1: Basic Architecture
+		//     Section 13.6: Processor tracking of XSAVE-managed state
+		return get_task_fpregs(pid, xsave);
 	}
 
 	return 0;
+}
+
+static inline void fixup_mxcsr(struct xsave_struct *xsave)
+{
+	/*
+	 * Right now xsave->i387.mxcsr filled with the random garbage,
+	 * let's make it valid by applying mask which allows all
+	 * features, except the denormals-are-zero feature bit.
+	 *
+	 * See also fpu__init_system_mxcsr function:
+	 * https://github.com/torvalds/linux/blob/8cb1ae19/arch/x86/kernel/fpu/init.c#L117
+	 */
+	xsave->i387.mxcsr &= 0x0000ffbf;
 }
 
 /* See arch/x86/kernel/fpu/xstate.c */
@@ -272,17 +296,6 @@ static void validate_random_xstate(struct xsave_struct *xsave)
 
 	/* No reserved bits may be set */
 	memset(&hdr->reserved, 0, sizeof(hdr->reserved));
-
-	/*
-	 * While using PTRACE_SETREGSET the kernel checks that
-	 * "Reserved bits in MXCSR must be zero."
-	 * if (mxcsr[0] & ~mxcsr_feature_mask)
-	 *	return -EINVAL;
-	 *
-	 * As the mxcsr_feature_mask depends on the CPU the easiest solution for
-	 * this error injection test is to set mxcsr just to zero.
-	 */
-	xsave->i387.mxcsr = 0;
 }
 
 /*
@@ -308,6 +321,8 @@ static int corrupt_extregs(pid_t pid)
 	 *    (and the seed will be known from automatic testing).
 	 */
 	pr_err("Corrupting %s for %d, seed %u\n", use_xsave ? "xsave" : "fpuregs", pid, init_seed);
+
+	fixup_mxcsr(&ext_regs);
 
 	if (!use_xsave) {
 		if (ptrace(PTRACE_SETFPREGS, pid, NULL, &ext_regs)) {
@@ -584,6 +599,7 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 
 int ptrace_set_breakpoint(pid_t pid, void *addr)
 {
+	k_rtsigset_t block;
 	int ret;
 
 	/* Set a breakpoint */
@@ -599,6 +615,16 @@ int ptrace_set_breakpoint(pid_t pid, void *addr)
 		return -1;
 	}
 
+	/*
+	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
+	 * will be reset to the default one.
+	 */
+	ksigfillset(&block);
+	ksigdelset(&block, SIGTRAP);
+	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
+		pr_perror("Can't block signals for %d", pid);
+		return -1;
+	}
 	ret = ptrace(PTRACE_CONT, pid, NULL, NULL);
 	if (ret) {
 		pr_perror("Unable to restart the  stopped tracee process %d", pid);
