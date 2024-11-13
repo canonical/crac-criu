@@ -109,7 +109,6 @@ DEFINES			+= -D_FILE_OFFSET_BITS=64
 DEFINES			+= -D_GNU_SOURCE
 
 WARNINGS		:= -Wall -Wformat-security -Wdeclaration-after-statement -Wstrict-prototypes
-WARNINGS		+= -Wno-format-truncation -Wno-stringop-overflow
 
 # -Wdangling-pointer results in false warning when we add a list element to
 # local list head variable. It is false positive because before leaving the
