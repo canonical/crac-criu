@@ -35,3 +35,6 @@ compel/include/asm
 include/common/asm
 include/common/config.h
 build/**
+*.class
+*dump-dir
+output

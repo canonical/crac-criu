@@ -1,0 +1,28 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ crac ]
+  pull_request:
+    branches: [ crac ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      with:
+        submodules: true
+
+    - name: Build and run Java integration tests
+      run: sudo make -C scripts/ci java-it
+
+    - name: Upload logfile
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: maven-surefire-reports
+        path: |
+          ${{ github.workspace }}/logs

@@ -63,6 +63,9 @@ podman-test:
 java-test:
 	./java-test.sh
 
+java-it:
+	./java-it.sh
+
 setup-vagrant:
 	./vagrant.sh setup
 
