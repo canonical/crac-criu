@@ -1,0 +1,63 @@
+name: Build and run Java tests 
+
+on:
+  push:
+    branches: [ crac ]
+  pull_request:
+    branches: [ crac ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      with:
+        submodules: true
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install asciidoc \
+        protobuf-c-compiler \
+        libprotobuf-c-dev \
+        libaio-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
+        libcap-dev \
+        libnl-3-dev \
+        build-essential \
+        python3-protobuf \
+        python3-yaml \
+        libnet-dev \
+        libnl-route-3-dev \
+        libbsd-dev \
+        make \
+        maven \
+        git \
+        pkg-config \
+        iptables \
+        gcc-14 \
+        libgcc-14-dev \
+        uuid-dev \
+        libselinux1 \
+        libselinux1-dev \
+        xmlto -y
+
+    - name: Build crac-criu
+      run: |
+        sudo make install
+
+    - name: Run Java tests
+      run: |
+        cd test/javaTests
+        sudo mvn -DneverCleanFailures=true test
+
+    - name: Upload logfile
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: maven-surefire-reports
+        path: |
+          ${{ github.workspace }}/test/javaTests/output
