@@ -26,6 +26,13 @@
 
 #include "linux/rseq.h"
 
+#ifdef __has_include
+#if __has_include("sys/rseq.h")
+#include <sys/rseq.h>
+#include "asm/thread_pointer.h"
+#endif
+#endif
+
 #include "clone-noasan.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -1929,7 +1936,7 @@ static void finalize_restore(void)
 			continue;
 
 		/* Unmap the restorer blob */
-		ctl = compel_prepare_noctx(pid);
+		ctl = compel_prepare_noctx(pid, false);
 		if (ctl == NULL)
 			continue;
 
@@ -2519,34 +2526,48 @@ static long restorer_get_vma_hint(struct list_head *tgt_vma_list, struct list_he
 	end_vma.e = &end_e;
 	end_e.start = end_e.end = kdat.task_size;
 
+	/* Both lists should not be empty. */
 	s_vma = list_first_entry(self_vma_list, struct vma_area, list);
 	t_vma = list_first_entry(tgt_vma_list, struct vma_area, list);
 
 	while (1) {
 		if (prev_vma_end + vma_len > s_vma->e->start) {
+			if (s_vma == &end_vma)
+				break;
+
+			if (prev_vma_end < s_vma->e->end)
+				prev_vma_end = s_vma->e->end;
+			/*
+			 * VMA_AREA_GUARD entries are synthetic and they are
+			 * always after real vma entries.
+			 */
 			if ((s_vma->list.next == self_vma_list) ||
 			    vma_area_is(vma_next(s_vma), VMA_AREA_GUARD)) {
 				s_vma = &end_vma;
 				continue;
 			}
-			if (s_vma == &end_vma)
-				break;
-			if (prev_vma_end < s_vma->e->end)
-				prev_vma_end = s_vma->e->end;
+
 			s_vma = vma_next(s_vma);
 			continue;
 		}
 
 		if (prev_vma_end + vma_len > t_vma->e->start) {
+			if (t_vma == &end_vma)
+				break;
+
+			if (prev_vma_end < t_vma->e->end)
+				prev_vma_end = t_vma->e->end;
+
+			/*
+			 * VMA_AREA_GUARD entries are synthetic and they are
+			 * always after real vma entries.
+			 */
 			if ((t_vma->list.next == tgt_vma_list) ||
 			    vma_area_is(vma_next(t_vma), VMA_AREA_GUARD)) {
 				t_vma = &end_vma;
 				continue;
 			}
-			if (t_vma == &end_vma)
-				break;
-			if (prev_vma_end < t_vma->e->end)
-				prev_vma_end = t_vma->e->end;
+
 			t_vma = vma_next(t_vma);
 			continue;
 		}
