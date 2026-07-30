@@ -265,11 +265,17 @@ criu-deps	+= $(SOCCR_A)
 # LZ4 library
 #
 LZ4_OBJS = lz4/lib/liblz4.a criu/liblz4io.a
-$(LZ4_OBJS) :
+
+lz4/lib/liblz4.a:
 	git submodule init
 	git submodule update
 	$(Q) env -i PATH="$$PATH" make CC=$(CC) CFLAGS="$(CFLAGS)" -C lz4 lib lz4
-	$(Q) $(AR) rcs criu/liblz4io.a lz4/programs/lz4io.o
+
+criu/liblz4io.a: lz4/lib/liblz4.a
+	git submodule init
+	git submodule update
+	$(Q) env -i PATH="$$PATH" make CC=$(CC) CFLAGS="$(CFLAGS)" -C lz4 lib lz4
+	$(Q) $(AR) rcs $@ lz4/programs/lz4io.o
 
 criu-deps += $(LZ4_OBJS)
 CFLAGS += -I.
