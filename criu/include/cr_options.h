@@ -104,6 +104,16 @@ enum FILE_VALIDATION_OPTIONS {
 /* This constant dictates which file validation method should be tried by default. */
 #define FILE_VALIDATION_DEFAULT FILE_VALIDATION_BUILD_ID
 
+enum IMAGE_IO_MODE {
+	/* Buffered I/O for the pages image; the host page cache is used. */
+	IMAGE_IO_WRITEBACK = 0,
+	/* O_DIRECT for the pages image; the host page cache is bypassed. */
+	IMAGE_IO_DIRECT
+};
+
+/* This constant dictates which I/O mode is used for the pages image by default. */
+#define IMAGE_IO_DEFAULT IMAGE_IO_WRITEBACK
+
 /* This constant dictates that criu use fiemap to copy ghost file by default.*/
 #define FIEMAP_DEFAULT 1
 
@@ -113,6 +123,7 @@ struct irmap_path_opt {
 	struct list_head node;
 	struct irmap *ir;
 };
+
 
 enum criu_mode {
 	CR_UNSET = 0,
@@ -158,6 +169,10 @@ struct cr_options {
 	struct list_head inherit_fds;
 	struct list_head external;
 	struct list_head join_ns;
+	char **plugin_options;
+	int plugin_options_default_n;
+	int plugin_options_n;
+	int plugin_options_max;
 	char *libdir;
 	int use_page_server;
 	unsigned short port;
@@ -181,9 +196,6 @@ struct cr_options {
 	bool aufs; /* auto-detected, not via cli */
 	bool overlayfs;
 	int ghost_fiemap;
-#ifdef CONFIG_BINFMT_MISC_VIRTUALIZED
-	bool has_binfmt_misc; /* auto-detected */
-#endif
 	size_t ghost_limit;
 	struct list_head irmap_scan_paths;
 	bool lsm_supplied;
@@ -222,8 +234,46 @@ struct cr_options {
 	int mmap_page_image;
 	int ptrace_allowed;
 
+	/*
+	 * Memory page compression mode (enum compress_mode):
+	 *   COMPRESS_OFF       (0) = no compression (default)
+	 *   COMPRESS_BLOCK     (1) = chunks of compress_block_size bytes
+	 *                            are compressed as one LZ4 block
+	 *
+	 * Predicate "is compression on?" is just `if (opts.compress_mode)`.
+	 */
+	int compress_mode;
+
+	/*
+	 * LZ4 acceleration level for page compression.
+	 * Internal: 0 means the user did not set a value (default acceleration).
+	 * CLI/RPC accept 1..LZ4_MAX_ACCELERATION (higher = faster, lower ratio).
+	 */
+	unsigned int compress_acceleration;
+
+	/*
+	 * Block size in bytes when compress_mode == COMPRESS_BLOCK.
+	 * Must be a multiple of PAGE_SIZE and <= MAX_BLOCK_SIZE.
+	 * 0 means "use default".
+	 */
+	unsigned int compress_block_size;
+
+	/*
+	 * Worker concurrency for LZ4 decoding and eligible large zero fills,
+	 * including the calling thread. 0 selects automatic concurrency; 1, the
+	 * default, keeps LZ4 decoding serial and disables zero-fill workers; values
+	 * above 1 limit aggregate worker concurrency.
+	 * Independent requests may still run concurrently. Active concurrency is
+	 * bounded by available CPUs, useful batch work, and the restore-wide CPU
+	 * budget.
+	 */
+	unsigned int decompress_threads;
+
 	/* This stores which method to use for file validation. */
 	int file_validation_method;
+
+	/* This stores the I/O mode (writeback/direct) for the pages image. */
+	int image_io_mode;
 
 	/* Shows the mode criu is running at the moment: dump/pre-dump/restore/... */
 	enum criu_mode mode;
@@ -257,7 +307,8 @@ extern struct cr_options opts;
 extern char *rpc_cfg_file;
 
 extern int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, int state);
+extern int check_stream_conflicts(void);
 extern int check_options(void);
-extern void init_opts(void);
+extern int init_opts(void);
 
 #endif /* __CR_OPTIONS_H__ */

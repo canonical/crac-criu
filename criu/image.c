@@ -19,7 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
-#include "pages-compress.h"
+#include "compression.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -86,6 +86,21 @@ int check_img_inventory(bool restore)
 	case CRTOOLS_IMAGES_V1_1:
 		/* newer images with extra magic in the head */
 		break;
+	case CRTOOLS_IMAGES_V1_2:
+		/* images may contain compressed memory page payloads */
+#ifndef CONFIG_LZ4
+		/*
+		 * V1_2 is inherited by incremental children even when the top
+		 * image did not compress new pages. Reject it before restore
+		 * setup rather than discovering an encoded parent only after
+		 * pagemap readers have been opened.
+		 */
+		if (restore) {
+			pr_err("LZ4 support is required for this image chain\n");
+			goto out_err;
+		}
+#endif
+		break;
 	default:
 		pr_err("Not supported images version %u\n", he->img_version);
 		goto out_err;
@@ -147,6 +162,73 @@ int check_img_inventory(bool restore)
 
 	}
 
+	if (he->has_compress) {
+		/* Validate the protobuf uint32 before narrowing it to the signed
+		 * command-line option field. Values above INT_MAX would otherwise
+		 * become negative and evade a signed upper-bound check. */
+		if (he->compress > COMPRESS_BLOCK) {
+			pr_err("Image has unknown compression mode %u\n", he->compress);
+			goto out_err;
+		}
+		if (he->compress && he->img_version < CRTOOLS_IMAGES_V1_2) {
+			pr_err("Image version %u cannot contain compressed memory pages\n",
+			       he->img_version);
+			goto out_err;
+		}
+		opts.compress_mode = he->compress ? COMPRESS_BLOCK : COMPRESS_OFF;
+		if (opts.compress_mode) {
+			if (he->has_compress_block_size && he->compress_block_size)
+				opts.compress_block_size = he->compress_block_size;
+			else if (!opts.compress_block_size)
+				opts.compress_block_size = PAGE_SIZE;
+		} else if (restore) {
+			opts.compress_acceleration = 0;
+			opts.compress_block_size = 0;
+		}
+
+		/*
+		 * On restore the compression mode usually comes from the
+		 * image inventory rather than the command line, so it is
+		 * not known when check_options() runs. Re-validate the
+		 * restore-path constraints here, once the mode is known.
+		 */
+		if (restore && opts.compress_mode) {
+#ifndef CONFIG_LZ4
+			pr_err("Image uses memory page compression but CRIU was built without LZ4 support (CONFIG_LZ4)\n");
+			goto out_err;
+#else
+			/*
+			 * The image-streamer and page-server/remote restore
+			 * readers only understand page-sized blocks.
+			 * A multi-page block-compressed image must use the local
+			 * restore path.
+			 */
+			if (opts.compress_block_size > PAGE_SIZE) {
+				if (opts.stream) {
+					pr_err("Multi-page block compressed image cannot be restored with --stream\n");
+					goto out_err;
+				}
+				if (opts.use_page_server || opts.addr) {
+					pr_err("Multi-page block compressed image cannot be restored via page-server\n");
+					goto out_err;
+				}
+			}
+#endif
+		}
+
+		if (opts.compress_mode)
+			pr_debug("Block decompression of memory pages is enabled\n");
+	} else if (restore) {
+		/*
+		 * Image without compression metadata (e.g. an older image).
+		 * Clear any compression mode so a stale setting cannot make
+		 * the compressed reader misinterpret uncompressed pages.
+		 */
+		opts.compress_mode = COMPRESS_OFF;
+		opts.compress_acceleration = 0;
+		opts.compress_block_size = 0;
+	}
+
 	ret = 0;
 
 out_err:
@@ -156,31 +238,52 @@ out_close:
 	return ret;
 }
 
+static struct inventory_plugin *find_inventory_plugin(const char *name)
+{
+	struct inventory_plugin *p;
+
+	list_for_each_entry(p, &inventory_plugins_list, node) {
+		if (!strcmp(name, p->name))
+			return p;
+	}
+
+	return NULL;
+}
+
 /**
- * Check if the 'plugins' field in the inventory image contains
- * the specified plugin name. If found, the plugin is removed
- * from the linked list.
+ * Check whether the 'plugins' field in the inventory image contains an exact
+ * match for the specified logical plugin name. This entry is left in the list
+ * (not removed and n_inventory_plugins is not decremented), so it can still be
+ * matched again later.
  */
-bool check_and_remove_inventory_plugin(const char *name, size_t n)
+bool has_inventory_plugin(const char *name)
 {
 	if (n_inventory_plugins == -1)
 		return true; /* backwards compatibility */
 
-	if (n_inventory_plugins > 0) {
-		struct inventory_plugin *p, *tmp;
+	return n_inventory_plugins > 0 && find_inventory_plugin(name);
+}
 
-		list_for_each_entry_safe(p, tmp, &inventory_plugins_list, node) {
-			if (!strncmp(name, p->name, n)) {
-				xfree(p->name);
-				list_del(&p->node);
-				xfree(p);
-				n_inventory_plugins--;
-				return true;
-			}
-		}
-	}
+/**
+ * Similar to the above function, check if the 'plugins' field contains
+ * the specified plugin name, but if it is found, remove it from the list.
+ */
+bool check_and_remove_inventory_plugin(const char *name)
+{
+	struct inventory_plugin *p;
 
-	return false;
+	if (n_inventory_plugins == -1)
+		return true; /* backwards compatibility */
+
+	p = find_inventory_plugin(name);
+	if (!p)
+		return false;
+
+	xfree(p->name);
+	list_del(&p->node);
+	xfree(p);
+	n_inventory_plugins--;
+	return true;
 }
 
 /**
@@ -239,13 +342,26 @@ void free_inventory_plugins_list(void)
 	n_inventory_plugins = 0;
 }
 
-int write_img_inventory(InventoryEntry *he)
+static uint32_t inventory_image_version(const InventoryEntry *he,
+					const InventoryEntry *parent_ie)
+{
+	if ((he->has_compress && he->compress) ||
+	    (parent_ie && parent_ie->img_version == CRTOOLS_IMAGES_V1_2))
+		return CRTOOLS_IMAGES_V1_2;
+	if (he->img_version)
+		return he->img_version;
+	return CRTOOLS_IMAGES_V1_1;
+}
+
+int write_img_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 {
 	PluginsEntry pe = PLUGINS_ENTRY__INIT;
 	struct cr_img *img;
 	int ret;
 
-	pr_info("Writing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
+	he->img_version = inventory_image_version(he, parent_ie);
+
+	pr_info("Writing image inventory (version %u)\n", he->img_version);
 
 	img = open_image(CR_FD_INVENTORY, O_DUMP);
 	if (!img)
@@ -273,6 +389,7 @@ int write_img_inventory(InventoryEntry *he)
 	xfree(pe.plugins);
 
 	xfree(he->root_ids);
+	xfree(he->dump_criu_run_id);
 	close_image(img);
 	if (ret < 0)
 		return -1;
@@ -296,63 +413,80 @@ int inventory_save_uptime(InventoryEntry *he)
 }
 
 /*
- * This function is intended to get an inventory image from previous (parent)
- * dump iteration. We use dump_uptime from the image in detect_pid_reuse().
- *
- * You see that these function never fails by itself, it only prints warnings
- * to better understand reasons why we don't found a proper image, failing here
- * is too early. We get to detect_pid_reuse() only if we have a parent pagemap
- * and that's the proper place to fail: we know that there is a parent pagemap
- * but we don't have (can't access, etc) parent inventory => can't detect
- * pid-reuse => fail.
+ * Load the previous dump's inventory when a parent directory is configured.
+ * A NULL *parent_ie is reserved for the normal first-dump case. Once a parent
+ * directory exists its inventory is also needed to propagate the image-format
+ * version, so an unreadable or unsupported inventory is a hard error even when
+ * pidfds make the dump-uptime PID-reuse check unnecessary.
  */
-
-InventoryEntry *get_parent_inventory(void)
+int get_parent_inventory(InventoryEntry **parent_ie)
 {
 	struct cr_img *img;
-	InventoryEntry *ie;
+	InventoryEntry *ie = NULL;
 	int dir;
 
+	*parent_ie = NULL;
 	if (open_parent(get_service_fd(IMG_FD_OFF), &dir)) {
-		/*
-		 * We print the warning below to be notified that we had some
-		 * unexpected problem on open. For instance we have a parent
-		 * directory but have no access. Having no parent inventory
-		 * when also having no parent directory is an expected case of
-		 * first dump iteration.
-		 */
-		pr_warn("Failed to open parent directory\n");
-		return NULL;
+		pr_err("Failed to open parent directory\n");
+		return -1;
 	}
 	if (dir < 0)
-		return NULL;
+		return 0;
 
-	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR);
+	/* The parent snapshot is always on disk, even when streaming */
+	img = open_image_at(dir, CR_FD_INVENTORY, O_RSTR | O_FORCE_LOCAL);
 	if (!img) {
-		pr_warn("Failed to open parent pre-dump inventory image\n");
+		pr_err("Failed to open parent pre-dump inventory image\n");
 		close(dir);
-		return NULL;
+		return -1;
 	}
 
 	if (pb_read_one(img, &ie, PB_INVENTORY) < 0) {
-		pr_warn("Failed to read parent pre-dump inventory entry\n");
+		pr_err("Failed to read parent pre-dump inventory entry\n");
 		close_image(img);
 		close(dir);
-		return NULL;
+		return -1;
+	}
+
+	switch (ie->img_version) {
+	case CRTOOLS_IMAGES_V1:
+	case CRTOOLS_IMAGES_V1_1:
+	case CRTOOLS_IMAGES_V1_2:
+		break;
+	default:
+		pr_err("Unsupported parent image version %u\n", ie->img_version);
+		goto err;
+	}
+	if (ie->has_compress && ie->compress > COMPRESS_BLOCK) {
+		pr_err("Parent image has unknown compression mode %u\n",
+		       ie->compress);
+		goto err;
+	}
+	if (ie->has_compress && ie->compress &&
+	    ie->img_version < CRTOOLS_IMAGES_V1_2) {
+		pr_err("Parent image version %u cannot contain compressed memory pages\n",
+		       ie->img_version);
+		goto err;
 	}
 
 	if (!ie->has_dump_uptime) {
+		/* pidfd-based reuse detection does not need the legacy timestamp. */
 		pr_warn("Parent pre-dump inventory has no uptime\n");
-		inventory_entry__free_unpacked(ie, NULL);
-		ie = NULL;
 	}
 
 	close_image(img);
 	close(dir);
-	return ie;
+	*parent_ie = ie;
+	return 0;
+
+err:
+	inventory_entry__free_unpacked(ie, NULL);
+	close_image(img);
+	close(dir);
+	return -1;
 }
 
-int prepare_inventory(InventoryEntry *he)
+int prepare_inventory(InventoryEntry *he, const InventoryEntry *parent_ie)
 {
 	struct pid pid;
 	struct {
@@ -360,9 +494,10 @@ int prepare_inventory(InventoryEntry *he)
 		struct dmp_info d;
 	} crt = { .i.pid = &pid };
 
-	pr_info("Preparing image inventory (version %u)\n", CRTOOLS_IMAGES_V1);
-
-	he->img_version = CRTOOLS_IMAGES_V1_1;
+	he->has_compress = true;
+	he->compress = opts.compress_mode;
+	he->img_version = inventory_image_version(he, parent_ie);
+	pr_info("Preparing image inventory (version %u)\n", he->img_version);
 	he->fdinfo_per_id = true;
 	he->has_fdinfo_per_id = true;
 	he->ns_per_id = true;
@@ -402,6 +537,11 @@ int prepare_inventory(InventoryEntry *he)
 
 	if (!he->dump_criu_run_id)
 		return -1;
+
+	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
+		he->has_compress_block_size = true;
+		he->compress_block_size = opts.compress_block_size;
+	}
 
 	return 0;
 }
@@ -626,12 +766,8 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		ret = userns_call(userns_openat, UNS_FDOUT, &pa, sizeof(struct openat_args), dfd);
 		if (ret < 0)
 			errno = pa.err;
-	} else if (CR_FD_PAGES_COMP == type && flags == O_RDONLY) {
-		pr_debug("Wait for decompression thread, and replace file descriptor... (%s)\n", path);
-		ret = decompression_get_fd();
 	} else
 		ret = openat(dfd, path, flags, CR_FD_PERM);
-
 	if (ret < 0) {
 		if (!(flags & O_CREAT) && (errno == ENOENT || ret == -ENOENT)) {
 			pr_info("No %s image\n", path);
@@ -724,6 +860,26 @@ struct cr_img *img_from_fd(int fd)
 }
 
 /*
+ * The mode open_image_dir() wants for the current operation, or -1 for an
+ * operation that does not read or write an image set of its own.
+ */
+int image_dir_mode(void)
+{
+	switch (opts.mode) {
+	case CR_DUMP:
+		/* fallthrough */
+	case CR_CPUINFO_DUMP:
+		/* fallthrough */
+	case CR_PRE_DUMP:
+		return O_DUMP;
+	case CR_RESTORE:
+		return O_RSTR;
+	default:
+		return -1;
+	}
+}
+
+/*
  * `mode` should be O_RSTR or O_DUMP depending on the intent.
  * This is used when opts.stream is enabled for picking the right streamer
  * socket name. `mode` is ignored when opts.stream is not enabled.
@@ -748,7 +904,9 @@ int open_image_dir(const char *dir, int mode)
 	if (opts.stream) {
 		if (img_streamer_init(dir, mode) < 0)
 			goto err;
-	} else if (opts.img_parent) {
+	}
+
+	if (opts.img_parent) {
 		if (faccessat(fd, opts.img_parent, R_OK, 0)) {
 			pr_perror("Invalid parent image directory provided");
 			goto err;
@@ -817,7 +975,9 @@ void up_page_ids_base(void)
 
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	if (flags == O_RDONLY || flags == O_RDWR) {
+	unsigned long mode = flags & ~O_FORCE_LOCAL;
+
+	if (mode == O_RDONLY || mode == O_RDWR) {
 		PagemapHead *h;
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
 			return NULL;

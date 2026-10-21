@@ -56,12 +56,14 @@
 #include "tty.h"
 #include "net.h"
 #include "sk-packet.h"
+#include "sk-queue.h"
 #include "cpu.h"
 #include "elf.h"
 #include "cgroup.h"
 #include "cgroup-props.h"
 #include "file-lock.h"
 #include "page-xfer.h"
+#include "compression.h"
 #include "kerndat.h"
 #include "stats.h"
 #include "mem.h"
@@ -757,6 +759,8 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 			tc->has_pdeath_sig = true;
 			tc->pdeath_sig = ti->pdeath_sig;
 		}
+		tc->has_timerslack_ns = true;
+		tc->timerslack_ns = ti->timerslack_ns;
 		tc->comm = xstrdup(ti->comm);
 		if (tc->comm == NULL)
 			return -1;
@@ -1520,6 +1524,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	item->pid->ns[0].virt = misc.pid;
+	item->threads[0].ns[0].virt = misc.pid;
 	pstree_insert_pid(item->pid);
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
@@ -1688,7 +1693,7 @@ static int setup_alarm_handler(void)
 	return 0;
 }
 
-static int cr_pre_dump_finish(int status)
+static int cr_pre_dump_finish(int status, const InventoryEntry *parent_ie)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	struct pstree_item *item;
@@ -1708,6 +1713,14 @@ static int cr_pre_dump_finish(int status)
 
 	he.has_pre_dump_mode = true;
 	he.pre_dump_mode = opts.pre_dump_mode;
+
+	he.has_compress = true;
+	he.compress = opts.compress_mode;
+
+	if (opts.compress_mode == COMPRESS_BLOCK && opts.compress_block_size) {
+		he.has_compress_block_size = true;
+		he.compress_block_size = opts.compress_block_size;
+	}
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
@@ -1772,7 +1785,7 @@ err:
 	if (bfd_flush_images())
 		ret = -1;
 
-	if (write_img_inventory(&he))
+	if (write_img_inventory(&he, parent_ie))
 		ret = -1;
 
 	if (ret)
@@ -1846,17 +1859,12 @@ int cr_pre_dump_tasks(pid_t pid)
 	if (collect_and_suspend_lsm() < 0)
 		goto err;
 
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
+	if (get_parent_inventory(&parent_ie))
+		goto err;
 
 	for_each_pstree_item(item)
 		if (pre_dump_one_task(item, parent_ie))
 			goto err;
-
-	if (parent_ie) {
-		inventory_entry__free_unpacked(parent_ie, NULL);
-		parent_ie = NULL;
-	}
 
 	ret = cr_dump_shmem();
 	if (ret)
@@ -1867,10 +1875,10 @@ int cr_pre_dump_tasks(pid_t pid)
 
 	ret = 0;
 err:
+	ret = cr_pre_dump_finish(ret, parent_ie);
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
-
-	return cr_pre_dump_finish(ret);
+	return ret;
 }
 
 static int cr_lazy_mem_dump(void)
@@ -1900,6 +1908,7 @@ static int cr_lazy_mem_dump(void)
 static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
+	int plugin_ret;
 
 	if (disconnect_from_page_server())
 		ret = -1;
@@ -1954,7 +1963,6 @@ static int cr_dump_finish(int ret)
 		unsuspend_lsm();
 		network_unlock();
 		delete_link_remaps();
-		clean_cr_time_mounts();
 	}
 
 	if (!ret && opts.lazy_pages)
@@ -1963,7 +1971,29 @@ static int cr_dump_finish(int ret)
 	if (arch_set_thread_regs(root_item, true) < 0)
 		return -1;
 
-	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+	plugin_ret = run_plugins_all(DUMP_FINISH, ret ?: post_dump_ret);
+	if (plugin_ret && plugin_ret != -ENOTSUP) {
+		pr_err("DUMP_FINISH plugin hook failed, ret %d\n", plugin_ret);
+		if (!ret && !post_dump_ret && opts.final_state != TASK_ALIVE) {
+			/*
+			 * The tasks are resumed below, so undo what the
+			 * rollback above skipped for a successful dump.
+			 * Handlers that already saw a successful dump
+			 * must roll back their devices as well.
+			 */
+			unsuspend_lsm();
+			network_unlock();
+			delete_link_remaps();
+			ret = plugin_ret;
+			plugin_ret = run_plugins_all(DUMP_FINISH, ret);
+			if (plugin_ret && plugin_ret != -ENOTSUP)
+				pr_err("DUMP_FINISH plugin rollback failed, ret %d\n", plugin_ret);
+		}
+		if (!ret)
+			ret = plugin_ret;
+	}
+
+	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret ?: post_dump_ret);
 
 	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 	timing_stop(TIME_FROZEN);
@@ -1972,7 +2002,7 @@ static int cr_dump_finish(int ret)
 	free_file_locks();
 	free_link_remaps();
 	free_aufs_branches();
-	free_userns_maps();
+	free_userns_data();
 
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
@@ -1995,8 +2025,8 @@ int cr_dump_tasks(pid_t pid)
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
-	int pre_dump_ret = 0;
-	int ret = -1;
+	int ret;
+	int exit_code = -1;
 
 	kerndat_warn_about_madv_guards();
 
@@ -2016,9 +2046,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 	root_item->pid->real = pid;
 
-	pre_dump_ret = run_scripts(ACT_PRE_DUMP);
-	if (pre_dump_ret != 0) {
-		pr_err("Pre dump script failed with %d!\n", pre_dump_ret);
+	ret = run_scripts(ACT_PRE_DUMP);
+	if (ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", ret);
 		goto err;
 	}
 	if (init_stats(DUMP_STATS))
@@ -2045,7 +2075,10 @@ int cr_dump_tasks(pid_t pid)
 	if (parse_cg_info())
 		goto err;
 
-	if (prepare_inventory(&he))
+	if (get_parent_inventory(&parent_ie))
+		goto err;
+
+	if (prepare_inventory(&he, parent_ie))
 		goto err;
 
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
@@ -2093,9 +2126,6 @@ int cr_dump_tasks(pid_t pid)
 	if (seccomp_collect_dump_filters() < 0)
 		goto err;
 
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
-
 	if (collect_and_suspend_lsm() < 0)
 		goto err;
 
@@ -2104,10 +2134,13 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 	}
 
-	if (parent_ie) {
-		inventory_entry__free_unpacked(parent_ie, NULL);
-		parent_ie = NULL;
-	}
+	/*
+	 * This hook finalizes global device state. Run every implementation so
+	 * that one plugin cannot prevent another from completing its work.
+	 */
+	ret = run_plugins_all(DUMP_DEVICES_LATE, pid);
+	if (ret && ret != -ENOTSUP)
+		goto err;
 
 	/*
 	 * It may happen that a process has completed but its files in
@@ -2140,39 +2173,35 @@ int cr_dump_tasks(pid_t pid)
 	 * ipc shared memory, but an ipc namespace is dumped in a child
 	 * process.
 	 */
-	ret = cr_dump_shmem();
-	if (ret)
+	if (cr_dump_shmem())
 		goto err;
 
 	if (root_ns_mask) {
-		ret = dump_namespaces(root_item, root_ns_mask);
-		if (ret)
+		if (dump_namespaces(root_item, root_ns_mask))
 			goto err;
 	}
 
 	if ((root_ns_mask & CLONE_NEWTIME) == 0) {
-		ret = dump_time_ns(0);
-		if (ret)
+		if (dump_time_ns(0))
 			goto err;
 	}
 
 	if (dump_aa_namespaces() < 0)
 		goto err;
 
-	ret = dump_cgroups();
-	if (ret)
+	if (dump_cgroups())
 		goto err;
 
-	ret = fix_external_unix_sockets();
-	if (ret)
+	if (fix_external_unix_sockets())
 		goto err;
 
-	ret = tty_post_actions();
-	if (ret)
+	if (tty_post_actions())
 		goto err;
 
-	ret = inventory_save_uptime(&he);
-	if (ret)
+	if (sk_queue_post_actions())
+		goto err;
+
+	if (inventory_save_uptime(&he))
 		goto err;
 
 	he.has_pre_dump_mode = false;
@@ -2181,12 +2210,10 @@ int cr_dump_tasks(pid_t pid)
 		he.allow_uprobes = true;
 	}
 
-	ret = write_img_inventory(&he);
-	if (ret)
-		goto err;
+	exit_code = write_img_inventory(&he, parent_ie);
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 
-	return cr_dump_finish(ret);
+	return cr_dump_finish(exit_code);
 }

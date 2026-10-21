@@ -34,6 +34,7 @@ function test_c {
 
 	title_print "Run test-c"
 	setsid ./test-c build/criu_service.socket build/imgs_c < /dev/null &>> build/output_c
+	grep -qx "test-value" build/_marker_plugin_option
 
 	title_print "Restore test-c"
 	${CRIU} restore -v4 -o restore-c.log -D build/imgs_c
@@ -66,11 +67,32 @@ function test_restore_loop {
 	kill -SIGTERM ${P}
 }
 
+function test_stream {
+	if ! command -v criu-image-streamer > /dev/null; then
+		title_print "Skip test-stream, criu-image-streamer not installed"
+		return
+	fi
+
+	mkdir -p build/imgs_stream
+
+	title_print "Run test-stream"
+	P=$(../loop)
+	echo "pid ${P}"
+	./stream.py build/criu_service.socket build/imgs_stream ${P}
+}
+
 function test_ps {
 	mkdir -p build/imgs_ps
 
 	title_print "Run ps_test"
 	setsid ./ps_test.py build/criu_service.socket build/imgs_ps < /dev/null &>> build/output_ps
+}
+
+function test_ps_addr {
+	title_print "Run page server address test"
+	# Reuse dump images from test_c (page server needs pstree.img
+	# and inventory.img).
+	setsid ./test-ps-addr build/criu_service.socket build/imgs_c < /dev/null &>> build/output_ps_addr
 }
 
 function test_errno {
@@ -85,7 +107,9 @@ trap 'echo "FAIL"; stop_server' EXIT
 test_c
 test_py
 test_restore_loop
+test_stream
 test_ps
+test_ps_addr
 test_errno
 
 FAIL=0
