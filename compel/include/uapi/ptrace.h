@@ -11,8 +11,6 @@
 #include <sys/ptrace.h>
 #include <stdint.h>
 
-#include <compel/asm/breakpoints.h>
-
 /*
  * Some constants for ptrace that might be missing from the
  * standard library includes due to being (relatively) new.
@@ -98,6 +96,9 @@ struct __ptrace_rseq_configuration {
 #if defined(__x86_64__) && !defined(PT_ARCH_PRCTL)
 #define PTRACE_ARCH_PRCTL 30 /* From asm/ptrace-abi.h. */
 #endif
+
+#define COMPEL_PTRACE_OPTIONS \
+	(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACECLONE | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK)
 
 extern int ptrace_suspend_seccomp(pid_t pid);
 

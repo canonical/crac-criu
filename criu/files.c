@@ -607,11 +607,14 @@ int dump_my_file(int lfd, u32 *id, int *type)
 	struct pid me = {};
 	struct fd_opts fdo = {};
 	FdinfoEntry e = FDINFO_ENTRY__INIT;
+	int ret;
 
 	me.real = getpid();
 	me.ns[0].virt = -1; /* FIXME */
 
-	if (dump_one_file(&me, lfd, lfd, &fdo, NULL, &e, NULL))
+	ret = dump_one_file(&me, lfd, lfd, &fdo, NULL, &e, NULL);
+	xfree(e.xattr_security_selinux);
+	if (ret)
 		return -1;
 
 	*id = e.id;
@@ -656,10 +659,9 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 			FdinfoEntry e = FDINFO_ENTRY__INIT;
 
 			ret = dump_one_file(item->pid, dfds->fds[i + off], lfds[i], opts + i, ctl, &e, dfds);
-			if (ret)
-				break;
-
-			ret = pb_write_one(img, &e, PB_FDINFO);
+			if (!ret)
+				ret = pb_write_one(img, &e, PB_FDINFO);
+			xfree(e.xattr_security_selinux);
 			if (ret)
 				break;
 		}
@@ -1119,25 +1121,37 @@ out:
 	return ret;
 }
 
+/*
+ * This helper owns new_fd. On failure it closes either new_fd or, after
+ * reopen_fd_as() succeeds, the descriptor moved to fle->fe->fd.
+ */
 int setup_and_serve_out(struct fdinfo_list_entry *fle, int new_fd)
 {
 	struct file_desc *d = fle->desc;
 	pid_t pid = fle->pid;
 
 	if (reopen_fd_as(fle->fe->fd, new_fd))
-		return -1;
+		goto err;
+	new_fd = fle->fe->fd;
 
 	if (fcntl(fle->fe->fd, F_SETFD, fle->fe->flags) == -1) {
 		pr_perror("Unable to set file descriptor flags");
-		return -1;
+		goto err;
 	}
 
 	BUG_ON(fle->stage != FLE_INITIALIZED);
 	fle->stage = FLE_OPEN;
 
+	/*
+	 * After FLE_OPEN the descriptor may already be referenced
+	 * by other parts of restore; don't close it on failure.
+	 */
 	if (serve_out_fd(pid, fle->fe->fd, d))
 		return -1;
 	return 0;
+err:
+	close(new_fd);
+	return -1;
 }
 
 static int open_fd(struct fdinfo_list_entry *fle)

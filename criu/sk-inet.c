@@ -35,6 +35,7 @@
 #include "protobuf.h"
 #include "util.h"
 #include "namespaces.h"
+#include "plugin.h"
 
 #include "images/inventory.pb-c.h"
 
@@ -271,6 +272,7 @@ static struct inet_sk_desc *gen_uncon_sk(int lfd, const struct fd_parms *p, int 
 
 	sk->sd.family = family;
 	sk->type = type;
+	sk->uid = p->stat.st_uid;
 
 	if (sk->sd.family == AF_INET)
 		aux = sizeof(struct sockaddr_in);
@@ -526,6 +528,8 @@ static int do_dump_one_inet_fd(int lfd, u32 id, const struct fd_parms *p, int fa
 	ie.dst_port = sk->dst_port;
 	ie.backlog = sk->wqlen;
 	ie.flags = p->flags;
+	ie.uid = userns_uid(sk->uid);
+	ie.has_uid = true;
 
 	ie.fown = (FownEntry *)&p->fown;
 	ie.opts = &skopts;
@@ -678,6 +682,7 @@ int inet_collect_one(struct nlmsghdr *h, int family, int type, struct ns_id *ns)
 	d->wqlen = m->idiag_wqueue;
 	memcpy(d->src_addr, m->id.idiag_src, sizeof(u32) * 4);
 	memcpy(d->dst_addr, m->id.idiag_dst, sizeof(u32) * 4);
+	d->uid = m->idiag_uid;
 
 	if (tb[INET_DIAG_SHUTDOWN])
 		d->shutdown = nla_get_u8(tb[INET_DIAG_SHUTDOWN]);
@@ -707,8 +712,14 @@ static inline int tcp_connection(InetSkEntry *ie)
 static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 {
 	struct inet_sk_info *ii = o;
+	int ret;
 
 	ii->ie = pb_msg(base, InetSkEntry);
+
+	ret = run_plugins(UPDATE_INETSK, ii->ie->family, ii->ie->state, ii->ie->src_addr, ii->ie->dst_addr);
+	if (ret < 0 && ret != -ENOTSUP)
+		return -1;
+
 	if (tcp_connection(ii->ie))
 		tcp_locked_conn_add(ii);
 
@@ -888,6 +899,13 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	if (sk < 0) {
 		pr_perror("Can't create inet socket");
 		return -1;
+	}
+
+	if (ie->has_uid) {
+		if (fchown(sk, ie->uid, -1) < 0) {
+			pr_perror("Failed to set socket UID to %u", ie->uid);
+			goto err;
+		}
 	}
 
 	if (reset_setsockcreatecon())

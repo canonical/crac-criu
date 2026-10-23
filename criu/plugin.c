@@ -14,10 +14,16 @@
 #include "common/list.h"
 #include "log.h"
 
-cr_plugin_ctl_t cr_plugin_ctl = {
-	.head.next = &cr_plugin_ctl.head,
-	.head.prev = &cr_plugin_ctl.head,
-};
+cr_plugin_ctl_t cr_plugin_ctl;
+
+static void __attribute__((constructor)) cr_plugin_ctl_init(void)
+{
+	size_t i;
+
+	INIT_LIST_HEAD(&cr_plugin_ctl.head);
+	for (i = 0; i < ARRAY_SIZE(cr_plugin_ctl.hook_chain); i++)
+		INIT_LIST_HEAD(&cr_plugin_ctl.hook_chain[i]);
+}
 
 /*
  * If we met old version of a plugin, selfgenerate a plugin descriptor for it.
@@ -60,6 +66,9 @@ static cr_plugin_desc_t *cr_gen_plugin_desc(void *h, char *path)
 	__assign_hook(PAUSE_DEVICES, "cr_plugin_pause_devices");
 	__assign_hook(CHECKPOINT_DEVICES, "cr_plugin_checkpoint_devices");
 	__assign_hook(POST_FORKING, "cr_plugin_post_forking");
+	__assign_hook(RESTORE_INIT, "cr_plugin_restore_init");
+	__assign_hook(DUMP_DEVICES_LATE, "cr_plugin_dump_devices_late");
+	__assign_hook(UPDATE_INETSK, "cr_plugin_update_inetsk");
 
 #undef __assign_hook
 
@@ -204,12 +213,7 @@ int cr_plugin_init(int stage)
 {
 	int exit_code = -1;
 	char *path;
-	size_t i;
 	DIR *d;
-
-	INIT_LIST_HEAD(&cr_plugin_ctl.head);
-	for (i = 0; i < ARRAY_SIZE(cr_plugin_ctl.hook_chain); i++)
-		INIT_LIST_HEAD(&cr_plugin_ctl.hook_chain[i]);
 
 	if (opts.libdir == NULL) {
 		path = getenv("CRIU_LIBS_DIR");
@@ -257,8 +261,16 @@ int cr_plugin_init(int stage)
 			goto err;
 	}
 
-	if (stage == CR_PLUGIN_STAGE__RESTORE && check_inventory_plugins())
-		goto err;
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		int ret;
+
+		if (check_inventory_plugins())
+			goto err;
+
+		ret = run_plugins_all(RESTORE_INIT);
+		if (ret && ret != -ENOTSUP)
+			goto err;
+	}
 
 	exit_code = 0;
 err:

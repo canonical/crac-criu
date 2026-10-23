@@ -113,6 +113,7 @@ mmap_status_map = [
     ('VMA_AREA_MEMFD', 1 << 14),
     ('VMA_AREA_SHSTK', 1 << 15),
     ('VMA_AREA_UPROBES', 1 << 17),
+    ('VMA_AREA_NOT_ACCOUNTABLE', 1 << 18),
     ('VMA_UNSUPP', 1 << 31),
 ]
 
@@ -147,6 +148,7 @@ pmap_flags_map = [
     ('PE_PARENT', 1 << 0),
     ('PE_LAZY', 1 << 1),
     ('PE_PRESENT', 1 << 2),
+    ('PE_PAYLOAD_ALIGNED', 1 << 3),
 ]
 
 flags_maps = {
@@ -161,8 +163,9 @@ flags_maps = {
 gen_maps = {
     'task_state': {
         1: 'Alive',
-        3: 'Zombie',
-        6: 'Stopped'
+        2: 'Dead',
+        3: 'Stopped',
+        6: 'Zombie',
     },
 }
 
